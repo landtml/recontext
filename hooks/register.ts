@@ -23,9 +23,11 @@ import { buildFacts } from './facts'
 import { MAP_SYSTEM, STATE_SYSTEM, buildHandoff, mapPrompt, pickTail, statePrompt, tailSize, trimTail } from './handoff'
 import { READER_SYSTEM, checkDraft, formatRecall, namedNote, parseDraft, readerPrompt, renderEvidence, type RecallOutcome } from './reader'
 import { MOD_VERSION, SHRINK_HELP, parseShrinkArgs } from './command'
-import { expand, search } from './search'
+import { expand, RANKED_HITS, search } from './search'
 import { PANE_ID, PANE_TITLE, fillNow, recordFill, recordRecall, recordShrink, registerUi } from './ui'
 import { buildUnits, parseUnits, serializeUnits, type Unit } from './units'
+import { dirname, expandPath } from './paths'
+import { TAIL_BYTES, queuedMessages, queuedSection, unansweredQueued, type Queued } from './queued'
 
 type Config = {
   mode: 'haiku' | 'code'
@@ -67,7 +69,7 @@ export function readConfig(o: PluginOptions): Config {
     stateEffort: effort(o.stateEffort, 'medium'),
     mapEffort: effort(o.mapEffort, 'medium'),
     recallEffort: effort(o.recallEffort, 'medium'),
-    factsBudgetChars: num(o.factsBudgetChars, 12000),
+    factsBudgetChars: num(o.factsBudgetChars, 14000),
     tailChars: num(o.tailChars, 24000),
     recallScope: o.recallScope === 'session' ? 'session' : 'project',
     thresholdWarnAbove: num(o.thresholdWarnAbove, 200000),
@@ -81,7 +83,6 @@ const ymd = (ms: number): string => {
   const d = new Date(ms)
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
 }
-const dirname = (p: string): string => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) || '/' : '.')
 const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 function toast($: EngineInterface, message: string): void {
@@ -113,18 +114,21 @@ function addUsage(a: ModelUsage | undefined, b: ModelUsage | undefined): ModelUs
   }
 }
 
-/** A configured folder with `~` expanded and trailing slashes dropped; undefined when `~` has no HOME. */
+/** The home folder: HOME, else USERPROFILE (Windows). */
+async function homeOf($: EngineInterface): Promise<string | undefined> {
+  return ((await $.env.get('HOME').catch(() => undefined)) || (await $.env.get('USERPROFILE').catch(() => undefined))) || undefined
+}
+
+/** A configured folder with `~` expanded and trailing separators dropped; undefined when `~` has no home. */
 async function expandDir($: EngineInterface, p: string): Promise<string | undefined> {
-  const trimmed = (q: string): string => q.replace(/(.)\/+$/, '$1')
-  if (p !== '~' && !p.startsWith('~/')) return trimmed(p)
-  const home = await $.env.get('HOME')
-  return home ? trimmed(`${home}${p.slice(1)}`) : undefined
+  return expandPath(p, p.startsWith('~') ? { HOME: await homeOf($) } : {})
 }
 
 async function resolveDir($: EngineInterface, cfg: Config, transcriptPath: string): Promise<string | undefined> {
   if (cfg.handoffDir !== '') return expandDir($, cfg.handoffDir)
   return transcriptPath !== '' ? `${dirname(transcriptPath)}/handoffs` : undefined
 }
+
 
 const EARLIER_SHOWN = 10
 
@@ -323,6 +327,18 @@ const withoutHandle = ({ handle: _handle, ...m }: SessionMessage): SessionMessag
 /** The recall tool's full name, as the engine registered it. */
 let recallTool: string | undefined
 
+/** Messages queued mid-turn that the model has not seen (design 3.7): `queued_command` rows at the transcript's
+ *  end with no assistant row after them. One that a recent handed user message already holds is left out. */
+async function readQueued($: EngineInterface, path: string, handed: readonly SessionMessage[]): Promise<Queued[]> {
+  const { size } = await $.fs.stat(path)
+  const offset = Math.max(0, size - TAIL_BYTES)
+  const read = await $.fs.read(path, { offset, length: size - offset })
+  if (typeof read !== 'string') return []
+  const tail = offset > 0 ? read.slice(read.indexOf('\n') + 1) : read
+  const recent = handed.slice(-8).flatMap(m => (m.role === 'user' ? [m.text] : []))
+  return unansweredQueued(tail).filter(q => q.text === '' || !recent.some(t => t.includes(q.text)))
+}
+
 async function shrink($: EngineInterface, cfg: Config, e: SessionCompactInput, startedAt: number): Promise<SessionCompacted> {
   const start = pickTail(e.messages, cfg.tailChars)
   if (start < 0) throw new Error('no valid tail to keep')
@@ -338,8 +354,21 @@ async function shrink($: EngineInterface, cfg: Config, e: SessionCompactInput, s
   const failures: string[] = []
   const before = (await contextNow($)).tokens
 
+  // 0. messages queued mid-turn (0.2.9): carried at the top of the handoff and appended, as user messages, to what
+  // the archive, index, digest and facts read; the tail stays the engine's own messages
+  // a failed read goes to the debug log, not a problem: no file goes unwritten and the shrink is as in 0.2.8
+  let queued: Queued[] = []
+  let queuedError: string | undefined
+  if (transcriptPath)
+    try {
+      queued = await readQueued($, transcriptPath, e.messages)
+    } catch (err) {
+      queuedError = errText(err)
+    }
+  const msgs: readonly SessionMessage[] = queued.length ? [...e.messages, ...queuedMessages(queued)] : e.messages
+
   // 1-2. index shards and archive (written first, so the handoff only points at what exists)
-  const units = buildUnits(e.messages, { session: sid8, k })
+  const units = buildUnits(msgs, { session: sid8, k })
   let indexed = false
   let archivePath: string | undefined
   let archiveText: string | undefined
@@ -352,7 +381,7 @@ async function shrink($: EngineInterface, cfg: Config, e: SessionCompactInput, s
       failures.push(`index: ${errText(err)}`)
     }
     try {
-      archiveText = buildArchive(e.messages)
+      archiveText = buildArchive(msgs)
       await $.fs.write(`${dir}/archive/${name}.txt`, archiveText)
       archivePath = `${dir}/archive/${name}.txt`
     } catch (err) {
@@ -362,7 +391,7 @@ async function shrink($: EngineInterface, cfg: Config, e: SessionCompactInput, s
 
   // 3-4. digest and state of work
   const prevK = k - 1
-  const asked = await writeState($, cfg, e.messages, prevK, e.instructions)
+  const asked = await writeState($, cfg, msgs, prevK, e.instructions)
   // refs past this archive's end are repaired from the previous state or dropped (0.2.3); new lines labelled
   // with the previous shrink's number go back to plain #n (0.2.4), unless Haiku read that #k:n in the digest (0.2.5)
   const previous = previousStateOf(e.messages)
@@ -379,20 +408,29 @@ async function shrink($: EngineInterface, cfg: Config, e: SessionCompactInput, s
     }
   const empty = { current: archiveText !== undefined ? archiveEmptyLines(archiveText) : undefined, byArchive: emptyByArchive }
   const refCheck = asked.text
-    ? checkRefs(asked.text, e.messages.length, prevQualified, archiveLines, prevK >= 1 ? prevK : undefined, asked.read, empty)
+    ? checkRefs(asked.text, msgs.length, prevQualified, archiveLines, prevK >= 1 ? prevK : undefined, asked.read, empty)
     : undefined
   if (refCheck) asked.text = refCheck.text
 
   // 5-7. facts, handoff, tail
-  const facts = buildFacts(e.messages, {
+  const facts = buildFacts(msgs, {
     verbatimUserMessages: VERBATIM_USER_MESSAGES,
     factsBudgetChars: cfg.factsBudgetChars,
     archivePath,
     transcriptPath: transcriptPath || undefined,
     earlierResets: earlier,
     earlierArchives: archives,
+    stateText: asked.text,
+    home: await homeOf($),
   })
-  const handoffText = buildHandoff({ state: asked.text, facts, k, recallTool: indexed ? await ensureRecallTool($) : undefined, archivePath })
+  const handoffText = buildHandoff({
+    state: asked.text,
+    facts,
+    k,
+    recallTool: indexed ? await ensureRecallTool($) : undefined,
+    archivePath,
+    queued: queuedSection(queued),
+  })
   const handoff: SessionMessage = { role: 'user', text: handoffText, toolUses: [] }
   const tail = trimTail(e.messages.slice(start), cfg.tailChars)
   // A kept tool-result message goes without its handle, so the engine writes it fresh: kept whole, the engine's
@@ -415,7 +453,9 @@ async function shrink($: EngineInterface, cfg: Config, e: SessionCompactInput, s
       `${asked.sharded ? `${asked.sharded.slices} parts + merge, ` : ''}` +
       `${asked.text ? `Haiku ${asked.ms ?? '?'}ms, state ${asked.text.length} chars` : `no state (${asked.why ?? '?'})`}, ` +
       `refs ${refCheck ? `${refCheck.plain} plain / ${refCheck.qualified} old / ${refCheck.repaired} fixed / ${refCheck.dropped} dropped / ${refCheck.dead} dead` : 'n/a'}, ` +
-      `handoff ${handoffText.length} chars, tail ${e.messages.length - start} msgs ${tailSize(tail)} chars${failures.length ? `, problems: ${failures.join('; ')}` : ''}`,
+      `handoff ${handoffText.length} chars, tail ${e.messages.length - start} msgs ${tailSize(tail)} chars` +
+      `${queued.length ? `, queued ${queued.length}` : ''}${queuedError ? `, queued messages not read (${queuedError})` : ''}` +
+      `${failures.length ? `, problems: ${failures.join('; ')}` : ''}`,
   )
 
   try {
@@ -495,7 +535,7 @@ async function recall($: EngineInterface, cfg: Config, question: string, leads: 
   const hits = search(units, { question, leads }, { currentSession: sid8 })
   if (hits.length === 0) return done({ kind: 'not-found', leads: [] })
   const ceiling = cfg.haikuBudgetTokens - IDENTITY_RESERVE_TOKENS - estimateTokens(READER_SYSTEM) - estimateTokens(question) - READER_PROMPT_RESERVE_TOKENS
-  const chosen = expand(units, hits, EVIDENCE_CHARS, ceiling)
+  const chosen = expand(units, hits, EVIDENCE_CHARS, ceiling, RANKED_HITS)
   const { text: evidenceText, evidence } = renderEvidence(chosen)
   const note = namedNote(evidence, hits)
   const top = (n: number) => hits.slice(0, n).map(h => h.unit)

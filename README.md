@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/landtml/recontext/releases/latest"><img alt="Release" src="https://img.shields.io/badge/release-v0.2.8-D63A3A"></a>
+  <a href="https://github.com/landtml/recontext/releases/latest"><img alt="Release" src="https://img.shields.io/badge/release-v0.2.10-D63A3A"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
   <img alt="Claude Code plugin" src="https://img.shields.io/badge/Claude%20Code-plugin-D97757">
   <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&amp;logoColor=white">
@@ -68,14 +68,16 @@ Recontext moves the heavy lifting to code and a small model:
 compaction (auto threshold or /compact)
   1. CODE   split the conversation into units: each message, each tool call with its result
   2. CODE   write the archive (one line per message) and a search index, next to the transcript
-  3. CODE   build a digest: your words, Claude's words, one line per tool call; bulky tool output dropped
+  3. CODE   build a digest: your words, Claude's words, one line per tool call; bulky tool output dropped,
+            a one-line result kept for calls such as tests
             (a very long message is shortened and marked, its full text stays in the archive)
   4. HAIKU  write a short state of work from the digest: goal, next step, decisions and why, what failed.
             Every Haiku call stays under a token budget (default 80k, below Haiku's higher price tier);
             a larger digest is split into up to 6 parts, noted separately, then merged
   5. CODE   check every archive ref (#n, or #k:n for shrink k's archive): refs past an archive's end are
             repaired from the previous handoff or dropped, refs to empty lines are dropped
-  6. CODE   add exact facts: your last messages verbatim, files touched, failed commands, URLs, agents
+  6. CODE   add exact facts: your last messages verbatim, files touched, failed commands, URLs, agents,
+            and any message you sent while Claude was working
   7. CODE   keep the last messages word for word (tool calls paired with their results)
   -> the new context is the handoff plus that tail; the session model is never called
 
@@ -180,7 +182,7 @@ use the `/config` menu (each option is a row there) or `claude plugin configure 
 | `stateEffort` | `medium` | Reasoning effort for the state of work (`low`, `medium`, `high`, `xhigh`). |
 | `mapEffort` | `medium` | Reasoning effort for the notes on each part of a split shrink. |
 | `recallEffort` | `medium` | Reasoning effort for recall answers. |
-| `factsBudgetChars` | `12000` | Size limit of the exact facts in the handoff. |
+| `factsBudgetChars` | `14000` | Size limit of the exact facts in the handoff. |
 | `tailChars` | `24000` | Size limit of the messages kept word for word. |
 | `recallScope` | `project` | `session`: recall searches this session only. `project`: also this project's other sessions. |
 | `thresholdWarnAbove` | `200000` | Notice at session start when the auto-compact threshold is missing or above this. |

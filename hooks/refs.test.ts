@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { archiveEmptyLines, archiveLineCount, carriedLines, checkRefs, digestTalk, qualifyRefs } from './refs'
+import { archiveEmptyLines, archiveLineCount, checkRefs, qualifyRefs } from './refs'
 
 test('qualifyRefs: plain refs gain the archive number; qualified refs, headings and ids stay', () => {
   expect(qualifyRefs('Fixed G3 (#236, #84). Range #33–#39.', 4)).toBe('Fixed G3 (#4:236, #4:84). Range #4:33–#4:39.')
@@ -21,11 +21,6 @@ test('checkRefs: an unknown out-of-range ref is dropped and the brackets stay ti
   expect(checkRefs('A (#84, #433). B (#433). C #433 here.', 149).text).toBe('A (#84). B. C here.')
   expect(checkRefs('Range (#120–#500).', 149).text).toBe('Range (#120).')
   expect(checkRefs('Ambiguous (#300).', 149, '(#2:300) (#3:300)').dropped).toBe(1)
-})
-
-test('carriedLines: counts lines copied from the previous state, ignoring refs', () => {
-  const prev = '- The timer route is refused in SDK hosts (#4:236).\n- short'
-  expect(carriedLines('- The timer route is refused in SDK hosts (#236).\n- something new and different here', prev)).toBe(1)
 })
 
 test('checkRefs: a qualified ref past its archive\'s end is dropped, and never used to repair', () => {
@@ -134,8 +129,15 @@ test('checkRefs: without empty-line sets nothing is dead (the 0.2.6 behaviour)',
   expect(r).toMatchObject({ text: 'Cost (#6:84). New (#12).', dead: 0 })
 })
 
-test('digestTalk: counts lines that mention the digest, ignoring backticked text (0.2.8)', () => {
-  const state = ['- The digest cut this line off (#12).', '- Fixed `digest.ts` cap (#4).', '- Digest: unrelated', '- nothing here', '- digests plural is not counted', '1. src/digest.ts (#12)', '- The digest.ts write-up (#15)'].join('\n')
-  expect(digestTalk(state)).toBe(2)
-  expect(digestTalk('')).toBe(0)
+// ---------------------------------------------------------------- 0.2.10: ref tidy
+test('checkRefs: a dropped ref with a filler word leaves no empty bracket (0.2.10)', () => {
+  // "(#42 area)" with #42 an empty line was left as "( area)"
+  const empty = { current: new Set([42]) }
+  const check = (t: string) => checkRefs(t, 100, '', undefined, undefined, '', empty).text
+  expect(check('It works (#42 area).')).toBe('It works.')
+  expect(check('It works (#42 area, #5:7).')).toBe('It works (#5:7).')
+  expect(check('Done (see #42).')).toBe('Done.')
+  expect(check('Done (main loop #42).')).toBe('Done (main loop).')
+  expect(check('Kept (real words here).')).toBe('Kept (real words here).')
 })
+

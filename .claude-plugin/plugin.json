@@ -1,6 +1,6 @@
 {
   "name": "shrink",
-  "version": "0.2.8",
+  "version": "0.2.10",
   "description": "Token-efficient, low-loss context compaction for Claude Code: a script prunes the transcript, Haiku distills it instead of the session model, and a recall tool answers exact questions about the compacted conversation from a local archive.",
   "icon": "./assets/logo.png",
   "author": {
@@ -71,7 +71,7 @@
       "type": "number",
       "title": "Facts budget (chars)",
       "description": "Size limit of the exact facts in the handoff message.",
-      "default": 12000
+      "default": 14000
     },
     "tailChars": {
       "type": "number",

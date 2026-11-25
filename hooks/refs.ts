@@ -143,10 +143,16 @@ function checkCited(
     .replace(/\u0000[–-]/g, '')
     .replace(/\(([^()\n]*)\)/g, (whole, inner: string) => {
       if (!inner.includes(DROP)) return whole
+      // an item left with only a filler word or two ("#42 area", "see #42") goes with its ref (0.2.10)
       const items = inner
         .split(/\s*,\s*/)
         .map(s => s.trim())
-        .filter(s => s !== DROP && s !== '')
+        .map(s => {
+          if (!s.includes(DROP)) return s
+          const words = s.split(DROP).join(' ').trim().split(/\s+/).filter(w => w !== '')
+          return words.length <= 2 && words.every(w => FILLER.test(w)) ? '' : words.join(' ')
+        })
+        .filter(s => s !== '')
       return items.length ? `(${items.join(', ')})` : DROP
     })
     .replace(/\s*\u0000/g, '')
@@ -154,19 +160,7 @@ function checkCited(
   return { text: tidy, plain, qualified, repaired, dropped, relabeled, dead }
 }
 
-/** How many non-empty lines of `state` also appear, word for word, in `previous` (carried unchanged). */
-export function carriedLines(state: string, previous: string): number {
-  const norm = (s: string) => s.replace(/#\d+(:\d+)?/g, '#').replace(/\s+/g, ' ').trim().toLowerCase()
-  const prev = new Set(previous.split('\n').map(norm).filter(l => l.length > 20))
-  return state.split('\n').map(norm).filter(l => l.length > 20 && prev.has(l)).length
-}
-
-/** How many lines of `state` talk about the digest (0.2.8): counted only, never removed. The reader of a handoff never
- * sees the digest, so such a line is noise; the count shows whether prompt rev 5 stops it. Backticked text and file names
- * (`digest.ts`, `hooks/digest.test.ts`) are ignored: the conversation itself may be about such a file. */
-export function digestTalk(state: string): number {
-  return state.split('\n').filter(l => /\bdigest\b/i.test(l.replace(/`[^`]*`/g, '').replace(/\S*digest\.[a-z][\w.]*/gi, ''))).length
-}
+const FILLER = /^(area|see|cf\.?|etc\.?|and|also|e\.g\.)$/
 
 /** The last line number of an archive's text (`#n role ... | text` lines), 0 when none. */
 export function archiveLineCount(archive: string): number {

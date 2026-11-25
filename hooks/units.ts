@@ -18,6 +18,8 @@ export type Unit = {
   n: number
   /** A tool call whose result came in a later message: that message's archive line (0.2.4). */
   resultN?: number
+  /** Part 2 and later of a result longer than RESULT_CHARS (0.2.9); part 1 has none. */
+  part?: number
   kind: SourceKind
   tool?: string
   isError?: boolean
@@ -27,6 +29,9 @@ export type Unit = {
 }
 
 export const RESULT_CHARS = 8000
+/** A result is split into at most this many units of RESULT_CHARS; the rest is only in the transcript (0.2.9). */
+export const RESULT_PARTS = 8
+const PART_INPUT_CHARS = 200
 const MAX_ENTITIES = 50
 const SHARD_BYTES = 3 * 1024 * 1024
 
@@ -63,6 +68,16 @@ function inputEntities(u: ToolUseSummary): string[] {
 /** The recall tool's answers are summaries of the archive, so they rank as one, below raw tool output. */
 const isRecall = (tool: string | undefined): boolean => tool !== undefined && /(?:^|__)recall$/.test(tool)
 
+/** A result as RESULT_CHARS pieces, at most RESULT_PARTS; the last says how much is left and where it is. */
+function resultParts(result: string, toolUseId: string): string[] {
+  const parts: string[] = []
+  for (let at = 0; at < result.length && parts.length < RESULT_PARTS; at += RESULT_CHARS) parts.push(result.slice(at, at + RESULT_CHARS))
+  if (parts.length === 0) parts.push('')
+  const left = result.length - RESULT_PARTS * RESULT_CHARS
+  if (left > 0) parts[parts.length - 1] += `…[+${left} chars; full: transcript, tool_use_id ${toolUseId}]`
+  return parts
+}
+
 export function buildUnits(messages: readonly SessionMessage[], at: { session: string; k: number }): Unit[] {
   const rows = new Map<string, { text: string; isError: boolean; n: number }>()
   messages.forEach((m, i) => {
@@ -91,24 +106,20 @@ export function buildUnits(messages: readonly SessionMessage[], at: { session: s
       const row = rows.get(u.tool_use_id)
       const result = u.text ?? row?.text
       const isError = u.isError === true || (u.text === undefined && row?.isError === true)
-      const shown =
-        result === undefined
-          ? ''
-          : result.length > RESULT_CHARS
-            ? `\n${result.slice(0, RESULT_CHARS)}…[+${result.length - RESULT_CHARS} chars; full: archive #${n}]`
-            : `\n${result}`
-      unit(
-        n,
-        `.${j + 1}`,
-        isRecall(u.tool) ? 'handoff' : 'tool',
-        `${u.tool}: ${formatInput(u)}${shown}`,
-        {
-          tool: u.tool,
-          toolUseId: u.tool_use_id,
-          ...(u.text === undefined && row !== undefined ? { resultN: row.n } : {}),
-          ...(isError ? { isError: true as const } : {}),
-        },
-        inputEntities(u),
+      const input = formatInput(u, RESULT_CHARS)
+      const extra: Partial<Unit> = {
+        tool: u.tool,
+        toolUseId: u.tool_use_id,
+        ...(u.text === undefined && row !== undefined ? { resultN: row.n } : {}),
+        ...(isError ? { isError: true as const } : {}),
+      }
+      const kind = isRecall(u.tool) ? 'handoff' : 'tool'
+      // a long result is split into parts with the same line and call (0.2.9); past RESULT_PARTS, the transcript has it
+      const parts = result === undefined ? [] : resultParts(result, u.tool_use_id)
+      unit(n, `.${j + 1}`, kind, `${u.tool}: ${input}${parts.length ? `\n${parts[0]}` : ''}`, extra, inputEntities(u))
+      const short = input.length > PART_INPUT_CHARS ? `${input.slice(0, PART_INPUT_CHARS)}…` : input
+      parts.slice(1).forEach((p, q) =>
+        unit(n, `.${j + 1}p${q + 2}`, kind, `${u.tool} (part ${q + 2} of ${parts.length}): ${short}\n${p}`, { ...extra, part: q + 2 }, inputEntities(u)),
       )
     })
   })

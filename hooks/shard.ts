@@ -46,6 +46,16 @@ function split(lines: readonly DigestLine[], at: 'turn' | 'message'): DigestLine
   return out
 }
 
+/** A message's lines in groups that are never split: each line with the result lines after it (0.2.10). */
+function groups(lines: readonly DigestLine[]): DigestLine[][] {
+  const out: DigestLine[][] = []
+  for (const l of lines) {
+    if (l.kind === 'result' && out.length > 0) out[out.length - 1]!.push(l)
+    else out.push([l])
+  }
+  return out
+}
+
 /** Lines packed oldest first into chunks of at most `cap` tokens (a line over `cap` alone goes alone). */
 export function pack(lines: readonly DigestLine[], cap: number): DigestLine[][] {
   const chunks: DigestLine[][] = []
@@ -66,7 +76,7 @@ export function pack(lines: readonly DigestLine[], cap: number): DigestLine[][] 
       cur.push(...unit)
       used = c
     } else if (level === 0) for (const m of split(unit, 'message')) place(m, 1)
-    else if (level === 1) for (const l of unit) place([l], 2)
+    else if (level === 1) for (const g of groups(unit)) place(g, 2)
     else {
       flush()
       chunks.push(unit)
@@ -95,10 +105,10 @@ export function takeNewest(lines: readonly DigestLine[], cap: number): number {
       for (const unit of [...split(turn, 'message')].reverse()) {
         const mc = cost(unit)
         if (used + mc > cap) {
-          for (const l of [...unit].reverse()) {
-            if (used + lineCost(l) > cap) break
-            used += lineCost(l)
-            start--
+          for (const g of groups(unit).reverse()) {
+            if (used + cost(g) > cap) break
+            used += cost(g)
+            start -= g.length
           }
           break
         }
@@ -113,7 +123,7 @@ export function takeNewest(lines: readonly DigestLine[], cap: number): number {
 
 /**
  * The plan for a digest over budget: as few slices as the older text needs, with room in the merge for
- * one note per slice. Past `maxSlices`, older lines are dropped (tool, then assistant, then user, oldest first).
+ * one note per slice. Past `maxSlices`, older lines are dropped (result, tool, assistant, then user, oldest first).
  */
 export function planShards(lines: readonly DigestLine[], o: ShardBudget): ShardPlan {
   const maxSlices = o.maxSlices ?? MAX_SLICES

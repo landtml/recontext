@@ -1,12 +1,13 @@
 // buildDigest: what Haiku reads at a shrink (design 3.1). Pure and deterministic.
 //
 // The previous handoff's state of work first, then one line per user text, assistant text and
-// tool call; a tool's output appears only as a failure's first line (the index keeps the rest).
-// Over budget, tool lines go first, then assistant text, then user text, oldest first.
+// tool call. A failed call shows its first error line; a successful Bash, Agent, AskUserQuestion or mcp call gets
+// a `#n result:` line under it with an excerpt of its output (0.2.10; the index keeps the rest).
+// Over budget, result lines go first, then tool lines, then assistant text, then user text, oldest first.
 
 import type { SessionMessage, ToolUseSummary } from 'claude-code'
 import { lineNo } from './archive'
-import { HEADER as FACTS_HEADER, callSummary, firstErrorLine, personText } from './facts'
+import { HEADER as FACTS_HEADER, callSummary, firstErrorLine, noMatchExit, personText, shellParts } from './facts'
 import { HANDOFF_HEADER } from './prompt'
 import { qualifyRefs } from './refs'
 
@@ -29,7 +30,9 @@ function stateBody(stripped: string): string {
   const at = stripped.indexOf(FACTS_HEADER)
   const state = (at < 0 ? stripped : stripped.slice(0, at)).trimEnd()
   if (!state.startsWith(HANDOFF_HEADER)) return state
-  const heading = state.search(/^## /m)
+  // from `## State of work`: a section before it (messages queued mid-turn, 0.2.9) is not state
+  const own = state.search(/^## State of work\b/m)
+  const heading = own >= 0 ? own : state.search(/^## /m)
   return heading < 0 ? state : state.slice(heading)
 }
 
@@ -44,12 +47,90 @@ export function previousStateOf(messages: readonly SessionMessage[]): string | u
   return previous
 }
 
-export type DigestKind = 'tool' | 'assistant' | 'user'
+export type DigestKind = 'result' | 'tool' | 'assistant' | 'user'
 /** One digest line: `#n role: text`, from message n (1-based, as in the archive). */
 export type DigestLine = { kind: DigestKind; n: number; text: string }
 export type DigestParts = { previous?: string; lines: DigestLine[] }
 /** Notes that map workers wrote on older parts of the conversation (design 3.3), oldest first. */
 export type PartNote = { part: number; of: number; first: number; last: number; text: string }
+
+const RESULT_CHARS = 100
+const RESULT_TOOLS = /^(Bash|Agent|Task|AskUserQuestion|Skill|mcp__.+)$/
+const READ_WORD = /^(cat|head|tail|sed|grep|egrep|rg|ls|wc|find|stat|file|diff|echo|printf|pwd|cd|awk|sort|uniq|cut|tr|nl|jq|column|basename|dirname|realpath|true|git)$/
+const GIT_READ = /^(log|show|diff|status|ls-files|rev-parse|blame|grep)$/
+// `S=/tmp/x` names a path for the parts after it; `T=$(cmd)` runs a command
+const ASSIGNMENT = /^[A-Za-z_]\w*=[^\s`]*$/
+// `2>&1` and `2>/dev/null` only move output; any other `>` writes a file
+const HARMLESS_REDIRECT = /\d?>&\d|\d?>\s*\/dev\/null/g
+
+/**
+ * True when a shell command only reads: one line, and every part split at `;`, `&&`, `||` and `|` starts with a
+ * reading command (`sed` only with `-n` and never `-i`, `find` without `-delete`/`-exec`) and writes no file. Its output
+ * is already the file's text, so a result line would repeat what the call line names (0.2.10).
+ */
+export function readOnlyShell(command: string): boolean {
+  const c = command.trim()
+  if (c === '' || c.includes('\n') || /\btee\b/.test(c)) return false
+  const reads = (part: string): boolean => {
+    const text = part.replace(/^(do|then|else)\s+/, '')
+    if (text === 'done' || text === 'fi' || /^for \w+ in\b/.test(text)) return !text.includes('$(')
+    if (ASSIGNMENT.test(text)) return !text.includes('$(')
+    const words = text.split(/\s+/)
+    const cmd = (words[0] ?? '').split('/').pop() ?? ''
+    if (!READ_WORD.test(cmd) || text.replace(HARMLESS_REDIRECT, '').includes('>') || text.includes('<<')) return false
+    if (cmd === 'sed') return words.includes('-n') && !words.some(w => /^-\w*i/.test(w) || w.startsWith('--in-place'))
+    if (cmd === 'find') return !words.some(w => /^-(delete|exec|execdir|ok|fprint\w*)$/.test(w))
+    if (cmd === 'git') return GIT_READ.test(words[1] ?? '')
+    if (cmd === 'awk') return !/\bsystem\s*\(|\|\s*"/.test(text)
+    return true
+  }
+  return shellParts(c).every(({ text }) => reads(text))
+}
+const FAIL_MARK = /^\(fail\)|\bFAILED\b|^Traceback\b|^(error|Error|ERROR)(\[\w+\])?:/
+const SUMMARY = /^\d+ (pass|fail|skip)\b|\b\d+ (passed|failed|skipped|errors?)\b/
+// Output, not commands: a secret word only counts with a value after it ("token budget" is not a secret).
+const OUTPUT_SECRET =
+  /\bBearer\s+\S{8,}|\bsk-[\w-]{10,}|\bgh[pousr]_\w{10,}|\bAKIA[0-9A-Z]{16}\b|\beyJ[\w-]{10,}\.[\w-]{10,}|\b\w*(token|password|passwd|secret|api[_-]?key)\w*\s*[:=]\s*\S{8,}/i
+
+// what the harness adds after a command's own output (0.2.10): often the only last line, so it is skipped
+const HARNESS_NOTICE = /^Shell cwd was reset to |^\(Bash completed with no output\)$|^\[This command modified \d+ files?\b/
+// the recall tool's first line labels its answer as data; the answer follows
+const EXCEPTION = /^[\w.]*(Error|Exception|Interrupt|Exit)\b.*:|^[\w.]*(Error|Exception)$/
+const RECALL_HEADER = /^Recall \(archived conversation data\b/
+
+function bashOutcome(text: string): string {
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l !== '' && !HARNESS_NOTICE.test(l))
+  if (lines.length === 0) return '(no output)'
+  let fail = lines.find(l => FAIL_MARK.test(l))
+  // a traceback's header says nothing; its exception line ("KeyError: 'name'") says what failed
+  if (fail !== undefined && /^Traceback\b/.test(fail)) fail = lines.slice(lines.indexOf(fail) + 1).find(l => EXCEPTION.test(l)) ?? fail
+  const sums = lines.filter(l => l !== fail && SUMMARY.test(l)).slice(-3).map(l => l.replace(/^=+\s*|\s*=+$/g, ''))
+  const parts = [fail, sums.join(', ')].filter((p): p is string => p !== undefined && p !== '')
+  if (parts.length > 0) return parts.join(' · ')
+  // a closing "}" or "})" ends JSON and code listings; the last line with a word or number says more
+  return [...lines].reverse().find(l => /[\p{L}\p{N}]/u.test(l)) ?? lines[lines.length - 1]!
+}
+
+/**
+ * The `#n result:` text for a successful call, or undefined for tools whose output says little (reads, searches,
+ * edits). Pure; the caller drops the line on any exception (0.2.10).
+ */
+export function resultLine(tool: string, text: string): string | undefined {
+  if (!RESULT_TOOLS.test(tool)) return undefined
+  const first = text.split(/\r?\n/).map(l => l.trim()).find(l => l !== '' && !RECALL_HEADER.test(l)) ?? '(no output)'
+  let out: string
+  if (tool === 'Bash' && /^Command running in background with ID:/.test(first)) out = '(started in the background)'
+  else if (tool === 'Bash') out = bashOutcome(text)
+  else if ((tool === 'Agent' || tool === 'Task') && /^Async agent launched/.test(first)) out = '(started in the background)'
+  else if (tool === 'AskUserQuestion') {
+    const answers = [...text.matchAll(/"="(.*?)"(?=, "|\.\s+You\b|\.?\s*$)/gs)].map(m => m[1]!)
+    out = answers.length > 0 ? `answered: ${answers.join(' | ')}` : first
+  } else out = first
+  // only the line shown can leak; code listings elsewhere in the output ("maxTokens: X") withheld 60 lines (0.2.10)
+  if (OUTPUT_SECRET.test(out)) return '(output withheld: may hold a secret)'
+  const flatOut = flat(out)
+  return flatOut.length <= RESULT_CHARS ? flatOut : `${flatOut.slice(0, RESULT_CHARS)}…`
+}
 
 /** The previous state and one line per user text, assistant text and tool call, uncut. `prevK` as in buildDigest. */
 export function digestParts(messages: readonly SessionMessage[], prevK?: number): DigestParts {
@@ -59,7 +140,22 @@ export function digestParts(messages: readonly SessionMessage[], prevK?: number)
     const text = u.text ?? rows.get(u.tool_use_id)?.text ?? ''
     const isError = u.isError === true || (u.text === undefined && rows.get(u.tool_use_id)?.isError === true)
     const exit = u.tool === 'Bash' && /^(Error: )?Exit code [1-9]\d*/.test(text)
-    return isError || exit ? firstErrorLine(text) : undefined
+    if (!isError && !exit) return undefined
+    const command = u.input?.command
+    // exit 1 from a last grep or diff is a result, not a failure (0.2.10)
+    if (u.tool === 'Bash' && typeof command === 'string' && noMatchExit(command, text)) return undefined
+    return firstErrorLine(text)
+  }
+  const outcome = (u: ToolUseSummary): string | undefined => {
+    try {
+      const text = u.text ?? rows.get(u.tool_use_id)?.text
+      if (text === undefined) return undefined
+      const command = u.input?.command
+      if (u.tool === 'Bash' && typeof command === 'string' && readOnlyShell(command)) return undefined
+      return resultLine(u.tool, text)
+    } catch {
+      return undefined
+    }
   }
 
   let previous: string | undefined
@@ -80,6 +176,8 @@ export function digestParts(messages: readonly SessionMessage[], prevK?: number)
     for (const u of m.toolUses ?? []) {
       const error = failed(u)
       lines.push({ kind: 'tool', n, text: `#${n} tool ${u.tool}: ${callSummary(u)}${error === undefined ? '' : ` → error: ${error}`}` })
+      const result = error === undefined ? outcome(u) : undefined
+      if (result !== undefined) lines.push({ kind: 'result', n, text: `#${n} result: ${result}` })
     }
   })
   if (previous !== undefined && prevK !== undefined && prevK >= 1) previous = qualifyRefs(previous, prevK)
@@ -105,7 +203,7 @@ export function renderDigest(previous: string | undefined, lines: readonly Diges
  */
 export function dropLines(lines: readonly DigestLine[], over: number): { kept: DigestLine[]; dropped: number } {
   const gone = new Set<DigestLine>()
-  for (const kind of ['tool', 'assistant', 'user'] as const) {
+  for (const kind of ['result', 'tool', 'assistant', 'user'] as const) {
     for (const l of lines) {
       if (over <= 0) break
       if (l.kind !== kind) continue

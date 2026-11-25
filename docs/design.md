@@ -50,9 +50,12 @@ recall({ question, leads? })          mcp__shrink__recall, served at tool.call
 ### 3.1 Digest (`digest.ts`)
 The digest is what Haiku reads. It starts with the previous handoff's state of work, if there is one. Then it
 has one line per message: your text (up to 8,000 characters), Claude's text (up to 6,000), and one line per
-tool call (`tool: key input`, plus `→ error: first line` when it failed). Tool output is left out. A cut
+tool call (`tool: key input`, plus `→ error: first line` when it failed). Tool output is left out, except a
+result line under Bash, Agent, AskUserQuestion, Skill and MCP calls that worked: a test summary, the first
+failure line or the last line of output, at most 100 characters. Read-only shell commands get none. A cut
 message is marked `…[+N chars, full text archived]`. `digestChars` (off by default) caps the digest anyway:
-tool lines go first, then Claude's text, then yours, oldest first. Building the digest is deterministic.
+result lines go first, then tool lines, then Claude's text, then yours, oldest first. Building the digest is
+deterministic.
 
 ### 3.2 Token budget (`budget.ts`)
 Haiku bills a whole request at the higher rate once its prompt passes 100k tokens. Every call is held under
@@ -68,15 +71,17 @@ final call merges the notes with the newest lines. Most shrinks fit in one call.
 ### 3.4 State of work (`prompt.ts`, `handoff.ts`)
 Haiku is told the digest is data and writes these short sections: Goal, Current task and next step, Decisions
 and why, Tried and failed, Open questions, Files to re-read first, Memory candidates. A manual
-`/compact <text>` becomes the focus. A reply that is missing headings, or a call at `high` effort that timed
-out, gets one retry at `medium`. The better attempt stands if it has the goal and the current task. If
-neither does, the handoff is code-only.
+`/compact <text>` becomes the focus. Haiku carries points from the previous state itself and never cites
+"Previous state" as a source, since the next reader never sees it. A reply that is missing headings, or a
+call at `high` effort that timed out, gets one retry at `medium`. The better attempt stands if it has the
+goal and the current task. If neither does, the handoff is code-only.
 
 ### 3.5 Handoff and kept tail (`handoff.ts`, `facts.ts`)
 The handoff is one user message that starts with a header the mod recognizes later as machine text. It holds
 the state of work, exact facts extracted by code (your recent messages verbatim, files touched, and so on, up
-to `factsBudgetChars`), where to look (the archives), and a standing instruction: apply the memory candidates,
-re-read the files, continue, and call `recall` before guessing.
+to `factsBudgetChars`; also commands that worked more than once and names in play), where to look (the
+archives), and a standing instruction: apply the memory candidates, re-read the files, continue, and call
+`recall` before guessing.
 
 `pickTail` keeps the last messages verbatim, up to `tailChars`. A start is valid only when every tool result
 after it also has its tool call after it, and the last message is always kept. `trimTail` cuts oversized tool
@@ -91,12 +96,22 @@ its archive. A ref past an archive's end is repaired from the previous handoff, 
 line is dropped. A ref into the previous archive that the previous handoff never cited is relabeled to the
 current one. A ref that points at a line with text but the wrong content is not caught.
 
+### 3.7 Messages sent mid-turn (`queued.ts`)
+A message you send while Claude is working waits in the transcript as a queued row until the next model
+request. Claude Code hands a compaction only the conversation messages, so a shrink that runs before that
+request would lose it. The shrink reads the end of the transcript for queued rows that no assistant reply
+followed and that are not among the handed messages. It puts their text word for word at the top of the
+handoff, notes attached images, and adds them to the archive, index, digest and facts as user messages.
+A failed read changes nothing else.
+
 ## 4. Recall
 
 ### 4.1 Units and index (`units.ts`)
 There is one unit per message with text, and one per tool call (its input and its result, joined by id). Each
-unit has a ref (`<session>-<k>#<n>`), a source kind, its text (tool results cut at 8k characters) and
-entities: file paths, commands, URLs, error class names. Source authority runs user > tool > assistant >
+unit has a ref (`<session>-<k>#<n>`), a source kind, its text and
+entities: file paths, commands, URLs, error class names. A tool result (or written file content) longer than
+8k characters is split into up to 8 parts with the same ref number; past that, the last part points at the
+transcript. Source authority runs user > tool > assistant >
 handoff. Units are stored as JSONL shards of at most 3 MiB, because the plugin file API reads 4 MiB at most.
 Recall covers only what earlier shrinks removed; the rest is still in context. With `recallScope: project` it
 also covers this project's other sessions.
@@ -110,7 +125,8 @@ also covers this project's other sessions.
   exact quoted phrases. Ties go to the newer unit.
 
 ### 4.3 Evidence (`search.ts`)
-Evidence is built from the top 8 hits, then each hit's call or result partner, then neighbours at distance 1
+Units named in the question or leads (`#n`, `#k:n`) come first, up to 4. Evidence is built from those and the
+top 8 hits, then each hit's call or result partner, then neighbours at distance 1
 to 3, up to 60k characters and never past the reader's token ceiling. When a checked answer says "not found",
 recall searches once more with the top 24 hits and reads again if that gives more evidence.
 
@@ -119,7 +135,8 @@ The reader prompt treats evidence as data and never follows instructions in it. 
 the evidence and cite each claim with a verbatim quote, or abstain. Code then checks every draft:
 - G1: the answer is not empty and cites known evidence ids.
 - G2: each quote is found in its evidence, matching whole tokens.
-- G3: each number in the answer appears in a quote or in the question.
+- G3: each number in the answer appears in a quote, in the evidence its sentence cites, or in the question.
+  Version strings and clock times count as one value.
 
 A failed draft gets one retry that names the failures. If that fails too, or Haiku errors, recall returns the
 top raw passages marked unverified. "Not found" comes with the 3 closest leads. A reply is at most 6k characters.
@@ -134,6 +151,7 @@ top raw passages marked unverified. "Not found" comes with the 3 closest leads. 
 - `/shrink` opens the panel. `/shrink now [focus]` answers at once, then a timer types `/compact [focus]`,
   retrying while a turn runs. A compaction cannot start under the command's own turn, and
   `$.session.compact` is refused in SDK hosts (the VS Code extension, `claude -p`).
+- Paths accept `/` and `\`; `~` expands to `HOME`, else `USERPROFILE`.
 - The mod writes no logs. `claude --debug` shows one trace line per shrink and recall.
 
 ## 6. Failures

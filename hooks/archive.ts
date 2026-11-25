@@ -26,15 +26,16 @@ function cut(s: string, cap: number): string {
   return s.length <= cap ? s : `${s.slice(0, cap)}…[+${s.length - cap}]`
 }
 
-export function formatInput(use: Pick<ToolUseSummary, 'tool' | 'input'>): string {
+/** A call's input on one line; written content (Write/Edit text) is cut at `cap` (units pass a larger one, 0.2.9). */
+export function formatInput(use: Pick<ToolUseSummary, 'tool' | 'input'>, cap: number = WRITE_INPUT_CAP): string {
   const input = use.input ?? {}
   if (use.tool === 'Bash' && typeof input.command === 'string') return input.command
   if (!WRITE_TOOLS.has(use.tool)) return JSON.stringify(input)
   const shown: Record<string, unknown> = {}
   for (const [key, value] of Object.entries(input)) {
     if (PATH_KEYS.has(key)) shown[key] = value
-    else if (typeof value === 'string') shown[key] = cut(value, WRITE_INPUT_CAP)
-    else if (typeof value === 'object' && value !== null) shown[key] = cut(JSON.stringify(value), WRITE_INPUT_CAP)
+    else if (typeof value === 'string') shown[key] = cut(value, cap)
+    else if (typeof value === 'object' && value !== null) shown[key] = cut(JSON.stringify(value), cap)
     else shown[key] = value
   }
   return JSON.stringify(shown)

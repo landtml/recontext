@@ -85,7 +85,8 @@ test('G3 ignores list numbering at the start of a line', () => {
 test('G3 accepts numbers that the question itself gives', () => {
   const d = draft({ answer: 'No, client 550123 was not checked in loop 1 [E2].', citations: [{ id: 'E2', quote: 'invoices' }] })
   expect(checkDraft(d, ev, 'Was client 550123 checked in loop 1?')).toEqual([])
-  expect(checkDraft(d, ev)).toEqual(['G3:number_unsourced:1', 'G3:number_unsourced:550123'])
+  // 0.2.9: the cited E2 holds "1-2", so the bare 1 counts as sourced; 550123 is in no source
+  expect(checkDraft(d, ev)).toEqual(['G3:number_unsourced:550123'])
 })
 
 test('G3 still rejects a free-standing number found nowhere, and a number leading a unit', () => {
@@ -141,4 +142,67 @@ test('G3: a number a quote holds is sourced, even where it opens the quote like 
   // a list number in the answer itself is still not a value, and an unquoted value still fails
   expect(checkDraft({ ...d, answer: '1. The user said "ship" [E1].' }, evidence, 'q')).toEqual([])
   expect(checkDraft({ ...d, answer: 'The user picked option 3 [E1].' }, evidence, 'q')).toEqual(['G3:number_unsourced:3'])
+})
+
+// 0.2.9 gate repairs (accuracy review idea 2): numbers the cited unit holds, version strings and clock times, JSON escapes.
+const toolUnit = (n: number, text: string): Unit => ({ ref: `s1-1#${n}`, session: 's1', k: 1, n, kind: 'tool', text, entities: [] })
+
+test('G3: a number in the unit the same sentence cites is sourced (0.2.9)', () => {
+  const { evidence } = renderEvidence([toolUnit(4, 'Bash: claude plugin test .\n 189 pass\n 0 fail'), toolUnit(5, 'Bash: ls\nREADME.md')])
+  const d: Draft = { answer: 'It ran 189 tests and 0 failed [E1].', citations: [{ id: 'E1', quote: 'pass' }], abstain: false }
+  expect(checkDraft(d, evidence, 'q')).toEqual([])
+})
+
+test('G3: a number only in an uncited unit, or cited from another sentence, stays unsourced (0.2.9)', () => {
+  const { evidence } = renderEvidence([toolUnit(5, 'Bash: ls\nREADME.md'), toolUnit(4, 'Bash: claude plugin test .\n 189 pass\n 0 fail')])
+  const d: Draft = { answer: 'It ran 189 tests [E1].', citations: [{ id: 'E1', quote: 'README.md' }], abstain: false }
+  expect(checkDraft(d, evidence, 'q')).toEqual(['G3:number_unsourced:189'])
+  const split: Draft = {
+    answer: 'It ran 189 tests.\nThe listing shows the readme [E2].',
+    citations: [{ id: 'E2', quote: 'pass' }],
+    abstain: false,
+  }
+  expect(checkDraft(split, evidence, 'q')).toEqual(['G3:number_unsourced:189'])
+})
+
+test('G3: an answer with no [En] marker at all cites its whole citation list in every sentence (0.2.9)', () => {
+  const { evidence } = renderEvidence([toolUnit(5, 'Bash: ls\nREADME.md'), toolUnit(4, 'Bash: claude plugin test .\n 189 pass\n 0 fail')])
+  const cited: Draft = { answer: 'It ran 189 tests, 0 failed.', citations: [{ id: 'E2', quote: 'claude plugin test' }], abstain: false }
+  expect(checkDraft(cited, evidence, 'q')).toEqual([])
+  const other: Draft = { answer: 'It ran 189 tests.', citations: [{ id: 'E1', quote: 'README.md' }], abstain: false }
+  expect(checkDraft(other, evidence, 'q')).toEqual(['G3:number_unsourced:189'])
+  const nowhere: Draft = { answer: 'It ran 41 tests.', citations: [{ id: 'E2', quote: 'claude plugin test' }], abstain: false }
+  expect(checkDraft(nowhere, evidence, 'q')).toEqual(['G3:number_unsourced:41'])
+})
+
+test('G3: the cited unit must hold the value with its unit letters, not just the digits (0.2.9)', () => {
+  // E2 holds "1-2", so a bare 2 is in it, but "£2m" is a different value
+  const d = draft({ answer: 'It cost £2m [E2].', citations: [{ id: 'E2', quote: 'invoices' }] })
+  expect(checkDraft(d, ev, 'q')).toEqual(['G3:number_unsourced:2'])
+  const { evidence } = renderEvidence([toolUnit(4, 'Bash: time x\nreal 35ms')])
+  expect(checkDraft({ answer: 'It took 35ms [E1].', citations: [{ id: 'E1', quote: 'real' }], abstain: false }, evidence, 'q')).toEqual([])
+})
+
+test('G3: version strings and clock times are one value (0.2.9)', () => {
+  const { evidence } = renderEvidence([toolUnit(4, 'debug.log: session start: shrink 0.2.5 at 01:30:10')])
+  const ok: Draft = { answer: 'Version 0.2.5 started at 01:30:10 [E1].', citations: [{ id: 'E1', quote: '0.2.5 at 01:30:10' }], abstain: false }
+  expect(checkDraft(ok, evidence, 'q')).toEqual([])
+  const outside = renderEvidence([toolUnit(4, 'notes: shrink 0.2 then 5 more')]).evidence
+  const bad: Draft = { answer: 'Version 0.2.5 ran [E1].', citations: [{ id: 'E1', quote: 'notes' }], abstain: false }
+  expect(checkDraft(bad, outside, 'q')).toEqual(['G3:number_unsourced:0.2.5'])
+})
+
+test('G2: a quote matches unit text whose JSON escapes are decoded (0.2.9)', () => {
+  const { evidence } = renderEvidence([
+    toolUnit(4, 'Agent: {"description":"Review task 5","prompt":"Do it.\\nRead the task brief: /x/task-5-brief.md\\nThen \\"report\\"."}'),
+  ])
+  const d: Draft = {
+    answer: 'The agent was told to read the brief [E1].',
+    citations: [
+      { id: 'E1', quote: 'Read the task brief: /x/task-5-brief.md' },
+      { id: 'E1', quote: 'Then "report".' },
+    ],
+    abstain: false,
+  }
+  expect(checkDraft(d, evidence, 'q')).toEqual([])
 })

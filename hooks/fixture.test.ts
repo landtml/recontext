@@ -39,12 +39,11 @@ test("user messages: 7 of the person's, 5 verbatim; the reminder and 2 task noti
   expect(facts).not.toContain('<task-notification>')
 })
 
-test('files touched: 9 paths with hand-counted actions, by last touch', () => {
+test('files touched: 8 paths with hand-counted actions, by last touch; the blocked memory Write is not one (0.2.10)', () => {
   expect(section(facts, 'Files touched')).toEqual([
     `- ${ROOT}/invoicer/totals.py  R1 E1`,
     `- ${ROOT}/invoicer/config.py  R1`,
     `- ${ROOT}/tests/test_pdf_footer.py  W1 E1`,
-    `- ${MEMORY}/local-only-no-push.md  W1`,
     `- ${ROOT}/CLAUDE.md  E1`,
     `- ${ROOT}/invoicer/pdf.py  R1 E2`,
     `- ${ROOT}/invoicer/export.py  R1 E1`,

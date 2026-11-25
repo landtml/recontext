@@ -60,12 +60,48 @@ test('a recall answer is indexed as a summary (handoff), not as tool output', ()
   expect(units.map(u => [u.kind, u.tool])).toEqual([['handoff', 'mcp__shrink__recall']])
 })
 
-test('a long tool result is cut at 8,000 chars with a pointer to the archive line', () => {
+test('a long tool result is split into parts with the same line and call (0.2.9)', () => {
+  const body = Array.from({ length: 20000 }, (_, i) => String.fromCharCode(97 + (i % 26))).join('')
   const long: SessionMessage[] = [
-    { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'x', tool: 'Bash', input: { command: 'cat big' }, text: 'y'.repeat(9000) }] },
+    user('go'),
+    { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'x', tool: 'Bash', input: { command: 'cat big' }, text: body }] },
   ]
-  const [unit] = buildUnits(long, AT)
-  expect(unit!.text).toBe(`Bash: cat big\n${'y'.repeat(8000)}…[+1000 chars; full: archive #1]`)
+  const units = buildUnits(long, AT).filter(u => u.kind === 'tool')
+  expect(units.map(u => [u.ref, u.n, u.toolUseId, u.part])).toEqual([
+    ['abcd1234-2#2.1', 2, 'x', undefined],
+    ['abcd1234-2#2.1p2', 2, 'x', 2],
+    ['abcd1234-2#2.1p3', 2, 'x', 3],
+  ])
+  expect(units[0]!.text).toBe(`Bash: cat big\n${body.slice(0, 8000)}`)
+  expect(units[1]!.text).toBe(`Bash (part 2 of 3): cat big\n${body.slice(8000, 16000)}`)
+  expect(units[2]!.text).toBe(`Bash (part 3 of 3): cat big\n${body.slice(16000)}`)
+})
+
+test('past 8 parts, the last part says what was left and points at the transcript, not the archive (0.2.9)', () => {
+  const long: SessionMessage[] = [
+    { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'toolu_9', tool: 'Bash', input: { command: 'cat huge' }, text: 'z'.repeat(100000) }] },
+  ]
+  const units = buildUnits(long, AT)
+  expect(units).toHaveLength(8)
+  expect(units[7]!.text.endsWith('…[+36000 chars; full: transcript, tool_use_id toolu_9]')).toBe(true)
+  expect(units.some(u => u.text.includes('full: archive'))).toBe(false)
+})
+
+test('written content is indexed up to RESULT_CHARS, not the archive\'s 300 (0.2.9)', () => {
+  const content = `export function stateOfWork() {}\n${'x'.repeat(4900)}\nexport const TAIL_MARK = 1`
+  const msgs: SessionMessage[] = [
+    {
+      role: 'assistant',
+      text: '',
+      toolUses: [
+        { tool_use_id: 'w', tool: 'Write', input: { file_path: '/p/a.ts', content }, text: 'File created' },
+        { tool_use_id: 'e', tool: 'Edit', input: { file_path: '/p/a.ts', old_string: 'a', new_string: `${'y'.repeat(600)} handoffMessage` }, text: 'ok' },
+      ],
+    },
+  ]
+  const [w, e] = buildUnits(msgs, AT)
+  expect(w!.text).toContain('TAIL_MARK')
+  expect(e!.text).toContain('handoffMessage')
 })
 
 test('entitiesOf finds paths, URLs and error names, each once', () => {
@@ -93,10 +129,10 @@ test('parseUnits skips lines that are not units', () => {
   expect(parseUnits(`${good}\nnot json\n{"x":1}\n\n`)).toHaveLength(1)
 })
 
-test('the sample fixture: one tool unit per tool use', () => {
+test('the sample fixture: one tool unit per tool use (0.2.9)', () => {
   const uses = sample.reduce((n, m) => n + (m.toolUses ?? []).length, 0)
   const units = buildUnits(sample, { session: 'c0ffee12', k: 1 })
-  expect(units.filter(u => u.kind === 'tool')).toHaveLength(uses)
+  expect(units.filter(u => u.kind === 'tool' && u.part === undefined)).toHaveLength(uses)
   expect(units.every(u => u.text.length > 0)).toBe(true)
 })
 

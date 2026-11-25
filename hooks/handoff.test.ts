@@ -1,7 +1,8 @@
 import type { SessionMessage } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
-import { STATE_SYSTEM, buildHandoff, pickTail, statePrompt, tailSize, trimTail, MAP_SYSTEM, MAP_SECTIONS, mapPrompt } from './handoff'
+import { STATE_SYSTEM, buildHandoff, cleanReread, pickTail, statePrompt, tailSize, trimTail, MAP_SYSTEM, MAP_SECTIONS, mapPrompt } from './handoff'
 import { HANDOFF_HEADER, STATE_SECTIONS } from './prompt'
+import { MOD_VERSION } from './command'
 
 const TOOL = 'mcp__shrink__recall'
 
@@ -128,4 +129,66 @@ test('both prompts say a line ending in the cut marker was cut by the digest, an
     expect(p).toContain('a line that ends in "…[+N chars, full text archived]" was cut here, not in the conversation')
     expect(p).toContain('never mention the digest in your output')
   }
+})
+
+test('cleanReread drops re-read entries that are not paths and renumbers the list (0.2.9)', () => {
+  const state = [
+    '## Current task and next step',
+    '1. `git status` here is fine',
+    '## Files to re-read first',
+    '1. `~/a/README.md` (x)',
+    '2. `~/a/git status` and the diff from #232',
+    '3. notes/run-2/REPORT-2.md (`## Final`, table rows)',
+    '4. `~/a/hooks/facts.ts`, `handoff.ts` and `register.ts` (#90)',
+    '5. the plan',
+    '## Memory candidates',
+    '- none',
+  ].join('\n')
+  expect(cleanReread(state)).toBe(
+    [
+      '## Current task and next step',
+      '1. `git status` here is fine',
+      '## Files to re-read first',
+      '1. `~/a/README.md` (x)',
+      '2. notes/run-2/REPORT-2.md (`## Final`, table rows)',
+      '3. `~/a/hooks/facts.ts`, `handoff.ts` and `register.ts` (#90)',
+      '## Memory candidates',
+      '- none',
+    ].join('\n'),
+  )
+  expect(cleanReread('## Files to re-read first\nnone')).toBe('## Files to re-read first\nnone')
+  expect(cleanReread('## Goal\nx')).toBe('## Goal\nx')
+})
+
+test('buildHandoff cleans the re-read list of the state (0.2.9)', () => {
+  const h = buildHandoff({ state: '## Files to re-read first\n1. `a/b.ts`\n2. `npm test`', facts: '# Handoff facts (exact, extracted by code)', k: 1 })
+  expect(h).toContain('1. `a/b.ts`')
+  expect(h).not.toContain('npm test')
+})
+
+test('buildHandoff: queued messages come first, right after the shrink line (0.2.9)', () => {
+  const queued = '## Sent while Claude was working, not yet answered\nand check the parser too'
+  const h = buildHandoff({ state: '## Goal\nx', facts: '# Handoff facts (exact, extracted by code)', k: 3, queued })
+  const at = h.indexOf(queued)
+  expect(at).toBeGreaterThan(h.indexOf('(This is shrink 3'))
+  expect(at).toBeLessThan(h.indexOf('## State of work'))
+  expect(buildHandoff({ state: '## Goal\nx', facts: 'f', k: 3 })).not.toContain('Sent while Claude')
+})
+
+test('cleanReread keeps Windows paths (0.2.9)', () => {
+  const s = '## Files to re-read first\n1. `C:\\p\\hooks\\facts` (x)\n2. `git status`'
+  expect(cleanReread(s)).toBe('## Files to re-read first\n1. `C:\\p\\hooks\\facts` (x)')
+})
+
+test('both prompts explain result lines; version 0.2.10 (0.2.10)', () => {
+  for (const system of [STATE_SYSTEM, MAP_SYSTEM]) {
+    expect(system).toContain('a `#n result:` line under it holds an excerpt of its output')
+    expect(system).toContain('do not call its outcome unknown')
+    expect(system).not.toContain('(with the first error line when a call failed)')
+  }
+  expect(MOD_VERSION).toBe('0.2.10')
+})
+
+test('both prompts forbid citing the Previous state (0.2.10)', () => {
+  for (const p of [STATE_SYSTEM, MAP_SYSTEM]) expect(p).toContain('Never cite "Previous state" as a source')
 })

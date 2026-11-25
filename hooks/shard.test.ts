@@ -83,3 +83,20 @@ test('notes are cut to their share; a failed worker leaves its user lines, marke
   expect(note).not.toContain('#2 tool')
   expect(partNote([L('user', 4), L('tool', 9)], 2, 3, 'x')).toEqual({ part: 2, of: 3, first: 4, last: 9, text: 'x' })
 })
+
+test('pack: a result line stays with its call when a message is cut (0.2.10)', () => {
+  const lines = [L('user', 1), L('assistant', 2), L('tool', 2), L('result', 2, 20), L('tool', 2), L('result', 2, 20)]
+  const cap = cost([L('tool', 2), L('result', 2, 20), L('tool', 2)])
+  const chunks = pack(lines, cap)
+  expect(chunks.flat()).toEqual(lines)
+  for (const c of chunks) {
+    expect(c[0]!.kind).not.toBe('result')
+    expect(cost(c)).toBeLessThanOrEqual(cap)
+  }
+})
+
+test('takeNewest: the newest lines never start with a result line (0.2.10)', () => {
+  const lines = [L('user', 1), L('assistant', 2), L('tool', 2), L('result', 2, 20)]
+  expect(lines[takeNewest(lines, cost([L('result', 2, 20)]) + 5)]?.kind).not.toBe('result')
+  expect(takeNewest(lines, cost([L('tool', 2), L('result', 2, 20)]))).toBe(2)
+})

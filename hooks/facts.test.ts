@@ -1,7 +1,7 @@
 import type { SessionMessage, ToolUseSummary } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
 import { buildArchive } from './archive'
-import { buildFacts, personText, type FactsOptions } from './facts'
+import { HEADER, answersOf, buildFacts, commandKey, firstErrorLine, noMatchExit, personText, recipeForm, shellWrites, type FactsOptions } from './facts'
 import { HANDOFF_HEADER } from './prompt'
 
 const OPTS: FactsOptions = {
@@ -147,7 +147,7 @@ test('failed commands: errors and non-zero exits, with the first error line', ()
   expect(section(facts, 'Failed commands and errors')).toEqual([
     '- #2 Bash: pytest -q → E   AssertionError: 2 != 3',
     '- #2 Read: /p/missing → File does not exist.',
-    '- #2 Bash: make → make: *** No rule to make target',
+    '- #2 Bash: make → Exit code 2; last line: make: *** No rule to make target',
   ])
 })
 
@@ -159,7 +159,7 @@ test('failed commands: the outcome is read from the tool_result row too', () => 
     ],
     OPTS,
   )
-  expect(section(facts, 'Failed commands and errors')).toEqual(['- #1 Bash: false → Exit code 1'])
+  expect(section(facts, 'Failed commands and errors')).toEqual(['- #1 Bash: false → Exit code 1; no output'])
 })
 
 test('failed commands: at most 30, oldest dropped; long commands cut', () => {
@@ -351,4 +351,288 @@ test('earlier resets in different folders are named in full', () => {
 
 test('an earlier shrink handoff is never read as the person\'s words', () => {
   expect(personText(`${HANDOFF_HEADER}\n## State of work\nx`)).toBeUndefined()
+})
+
+// ---------------------------------------------------------------- 0.2.9: facts fixes (design 3.5)
+
+test('firstErrorLine: a non-zero exit with no error-looking line shows the exit code and the last line (0.2.9)', () => {
+  // regression: a grep match line was shown as the "error", so the row looked like a success
+  expect(firstErrorLine(`Exit code 2\n6:export const V = '1'\n3: "version"`)).toBe('Exit code 2; last line: 3: "version"')
+  expect(firstErrorLine('Exit code 1')).toBe('Exit code 1; no output')
+  expect(firstErrorLine('Exit code 1\nnpm ERR! missing script')).toBe('npm ERR! missing script')
+  expect(firstErrorLine('File does not exist.')).toBe('File does not exist.')
+})
+
+test('answersOf reads each answer by its question, quotes inside included (0.2.9)', () => {
+  const input = { questions: [{ question: 'Which "folder"?' }, { question: 'Which threshold?' }] }
+  const text = 'Your questions have been answered: "Which "folder"?"="Separate new project", "Which threshold?"="200k (Recommended)". You can now continue with these answers in mind.'
+  expect(answersOf(input, text)).toEqual([
+    { question: 'Which "folder"?', answer: 'Separate new project' },
+    { question: 'Which threshold?', answer: '200k (Recommended)' },
+  ])
+  expect(answersOf(input, 'User declined to answer')).toEqual([])
+  expect(answersOf({}, text)).toEqual([])
+})
+
+test('AskUserQuestion answers count as the user\'s words, at the line of the result (0.2.9)', () => {
+  const ask = call('AskUserQuestion', { questions: [{ question: 'Where should the new mod go?' }] }, {}, 'q1')
+  const facts = buildFacts(
+    [
+      user('build it'),
+      asst(ask),
+      {
+        role: 'user',
+        text: '',
+        toolUses: [],
+        toolResults: [{ tool_use_id: 'q1', isError: false, text: 'Your questions have been answered: "Where should the new mod go?"="Separate new project". You can now continue with these answers in mind.' }],
+      },
+    ],
+    OPTS,
+  )
+  expect(section(facts, "The user's last messages")).toEqual(['### #1', 'build it', '### #3', '[answer to "Where should the new mod go?"] Separate new project'])
+})
+
+test('shellWrites: files a command changes through sed -i, redirection and tee (0.2.9)', () => {
+  expect(shellWrites(`sed -i 's/a/b/' src/x.ts && echo hi > out/log.txt 2>/dev/null; cat a | tee -a notes.md`)).toEqual([
+    'src/x.ts',
+    'out/log.txt',
+    'notes.md',
+  ])
+  expect(shellWrites('cd /p/app && sed -i -e s/a/b/ -e s/c/d/ a.ts b.ts >> /p/log 2>&1')).toEqual(['/p/app/a.ts', '/p/app/b.ts', '/p/log'])
+  expect(shellWrites('echo "a > b" > "$OUT" >&2; ls > /dev/null; grep x f | sort')).toEqual([])
+  expect(shellWrites("cat > /p/eval.py <<'EOF'\nif a > b: print(1) >> c\nEOF\necho done >> ~/log.md")).toEqual(['/p/eval.py', '~/log.md'])
+  expect(shellWrites('python3 - <<EOF\nopen("x","w")\nEOF')).toEqual([])
+})
+
+test('files touched: a file changed by a shell command counts as S (0.2.9)', () => {
+  const facts = buildFacts(
+    [asst(call('Read', { file_path: '/p/a.ts' }, {}, 'r1'), call('Bash', { command: `sed -i 's/x/y/' /p/a.ts` }, { text: '' }, 'b1'))],
+    OPTS,
+  )
+  expect(facts).toContain('## Files touched (R read, W written, E edited, S changed by a shell command; counts)')
+  expect(section(facts, 'Files touched')).toEqual(['- /p/a.ts  R1 S1'])
+})
+
+// ---------------------------------------------------------------- 0.2.9: commands that worked, names in play (ideas 3, 4)
+
+const ok = (command: string, id: string) => call('Bash', { command }, { text: 'done' }, id)
+const okTimes = (command: string, times: number, tag: string) => Array.from({ length: times }, (_, j) => ok(command, `${tag}${j}`))
+const say = (text: string, ...toolUses: ToolUseSummary[]): SessionMessage => ({ role: 'assistant', text, toolUses })
+
+test('commandKey: the first three words after cd, env and timing prefixes (0.2.9)', () => {
+  expect(commandKey('cd x && claude plugin test a')).toBe('claude plugin test')
+  expect(commandKey('cd /p && FOO=1 && timeout 60 env A=b bun test --watch')).toBe('bun test --watch')
+  expect(commandKey('time npx tsc -p a')).toBe('npx tsc -p')
+})
+
+test('recipeForm: cut at the first top-level pipe or ; after the command, quotes and $( ) kept (0.2.9)', () => {
+  expect(recipeForm('cd ~/a && claude plugin test . 2>&1 | grep -B5 x | head -60')).toBe('cd ~/a && claude plugin test .')
+  expect(recipeForm('cd ~/a; claude plugin validate . 2>&1 | grep -i warn; sed -n 1,5p README.md')).toBe('cd ~/a; claude plugin validate .')
+  expect(recipeForm('npx tsc -p . && claude plugin test . || true')).toBe('npx tsc -p . && claude plugin test .')
+  expect(recipeForm('python3 x.py "a|b" \'c;d\' | head')).toBe('python3 x.py "a|b" \'c;d\'')
+  expect(recipeForm('X=$(bun a.ts | head -1) && bun b.ts "$X"')).toBe('X=$(bun a.ts | head -1) && bun b.ts "$X"')
+  expect(recipeForm('bun test 2>&1')).toBe('bun test 2>&1')
+})
+
+test('commands: inline scripts are not recipes, whatever the interpreter path (0.2.9)', () => {
+  const facts = buildFacts(
+    [user('go'), asst(...okTimes('.venv/bin/python -c "import x"', 2, 'p'), ...okTimes('/usr/bin/node -e "1"', 2, 'n'), ...okTimes('.venv/bin/python build.py 7', 2, 'r'))],
+    OPTS,
+  )
+  expect(section(facts, 'Commands that worked')).toEqual(['- `.venv/bin/python build.py 7` (ok 2x)'])
+})
+
+test('commands: the listed form is the command without its one-off filters (0.2.9)', () => {
+  const facts = buildFacts(
+    [user('go'), asst(ok('cd x && claude plugin test a 2>&1 | grep fail | head', 'a1'), ok('claude plugin test a | tail -3', 'a2'))],
+    OPTS,
+  )
+  expect(section(facts, 'Commands that worked')).toEqual(['- `claude plugin test a` (ok 2x)'])
+})
+
+test('commands: single-line Bash that ran ok twice or more, most-run first, latest form (0.2.9)', () => {
+  const facts = buildFacts(
+    [
+      user('go'),
+      asst(
+        ok('claude plugin test a', 'a1'),
+        ok('npx tsc -p a', 't1'),
+        ok('claude plugin test a', 'a2'),
+        ...okTimes('ls -la', 5, 'l'),
+        ...okTimes("cat > /p/x.py <<'EOF'\nprint(1)\nEOF", 2, 'h'),
+        ...Array.from({ length: 3 }, (_, j) => call('Bash', { command: 'make build' }, { isError: true, text: 'Exit code 1\nboom' }, `m${j}`)),
+        ...Array.from({ length: 2 }, (_, j) => call('Bash', { command: 'make lint' }, { text: 'Exit code 2\nwarn' }, `k${j}`)),
+        ok('npx tsc -p a', 't2'),
+        ok('cd x && claude plugin test a', 'a3'),
+        ok('git commit -m x', 'g1'),
+      ),
+    ],
+    OPTS,
+  )
+  expect(facts).toContain('## Commands that worked (ran ok; check before re-running)')
+  expect(section(facts, 'Commands that worked')).toEqual(['- `cd x && claude plugin test a` (ok 3x)', '- `npx tsc -p a` (ok 2x)'])
+})
+
+test('commands: carried from the previous handoff and merged (0.2.9)', () => {
+  const previous = [
+    HANDOFF_HEADER,
+    '## State of work',
+    'x',
+    '',
+    HEADER,
+    '',
+    '## Commands that worked (ran ok; check before re-running)',
+    '- `bun run build` (ok 4x)',
+    '- `npx tsc -p a` (ok 2x)',
+    '',
+    '## Where to look',
+    '- Archive: /a',
+  ].join('\n')
+  const facts = buildFacts([user(`<system-reminder>r</system-reminder>\n${previous}`), asst(ok('npx tsc -p b', 't1'))], OPTS)
+  expect(section(facts, 'Commands that worked')).toEqual(['- `bun run build` (ok 4x)', '- `npx tsc -p b` (ok 3x)'])
+})
+
+test('commands: side effects, secrets and backticks are never listed (0.2.9)', () => {
+  const risky = [
+    'rm -rf build',
+    'cd /p && git push origin main',
+    'gh release create v1',
+    'npm publish',
+    'TOKEN=abcdefghijklmnopqrstuvwxyz1 bun run deploy',
+    'curl -H "Authorization: Bearer abc" https://x.example/api',
+    'curl -s -X POST https://x.example/api',
+    'bun x `cat f`',
+    'git status',
+  ]
+  const facts = buildFacts([user('go'), asst(...risky.flatMap((c, j) => okTimes(c, 2, `r${j}_`)))], OPTS)
+  expect(facts).not.toContain('Commands that worked')
+})
+
+test('commands: the home folder is shown as ~ (0.2.9)', () => {
+  const facts = buildFacts([user('go'), asst(...okTimes('cd /home/u/app && bun test', 2, 'b'))], { ...OPTS, home: '/home/u' })
+  expect(section(facts, 'Commands that worked')).toEqual(['- `cd ~/app && bun test` (ok 2x)'])
+})
+
+test('names: identifiers the assistant wrote, most-used first, not already in the state or facts (0.2.9)', () => {
+  const facts = buildFacts(
+    [
+      user('please fix userOnlyName'),
+      say('I will change buildFacts; the the the the'),
+      say('buildFacts and checkDraft', call('Edit', { file_path: '/p/myModule.ts', old_string: 'myModule()', new_string: 'buildFacts()' }, {}, 'e1')),
+      say('buildFacts again, then stateBody and commit c0ffee12'),
+      say('', call('Bash', { command: 'python3 -c "print(__file__, \\"\\\\nSHEET\\")"' }, {}, 'b9')),
+    ],
+    { ...OPTS, stateText: '## Goal\nfix stateBody' },
+  )
+  expect(section(facts, 'Names in play')).toEqual(['`buildFacts`, `checkDraft`'])
+})
+
+test('budget: names drop first and leave no "more" line (0.2.9)', () => {
+  const msgs = [
+    ...Array.from({ length: 6 }, (_, i) => user(`message number ${i}`)),
+    say('alphaOne betaTwo gammaThree deltaFour epsilonFive'),
+  ]
+  const opts = { ...OPTS, verbatimUserMessages: 2 }
+  const full = buildFacts(msgs, opts)
+  const cut = buildFacts(msgs, { ...opts, factsBudgetChars: full.length - 20 })
+  expect(cut.length).toBeLessThanOrEqual(full.length - 20)
+  expect(section(cut, 'Earlier messages')).toEqual(section(full, 'Earlier messages'))
+  const names = section(cut, 'Names in play')
+  expect(names).toHaveLength(1)
+  expect(names[0]!.split(', ').length).toBeLessThan(5)
+  const none = buildFacts(msgs, { ...opts, factsBudgetChars: full.length - section(full, 'Names in play')[0]!.length - 20 })
+  expect(none).not.toContain('Names in play')
+  expect(section(none, 'Earlier messages')).toEqual(section(full, 'Earlier messages'))
+})
+
+test('earlier resets: Windows paths are grouped by their folder too (0.2.9)', () => {
+  const facts = buildFacts([user('go')], { ...OPTS, earlierResets: ['C:\\h\\session-handoff_x-1.md', 'C:\\h\\session-handoff_x-2.md'] })
+  expect(section(facts, 'Where to look')).toContain('- Earlier resets of this session (summary and facts each), in C:\\h\\: session-handoff_x-1.md, session-handoff_x-2.md')
+})
+
+// ---------------------------------------------------------------- 0.2.10: failed or blocked calls
+
+const GUARD = 'PreToolUse:Write hook error: [guard]: Write outside the research folder'
+
+test('files touched: a failed Write, Edit or Read is not a file touched (0.2.10)', () => {
+  // regression: a write blocked by a guard hook was listed as W1
+  const facts = buildFacts(
+    [
+      asst(
+        call('Write', { file_path: '/m/memory/note.md', content: 'x' }, { isError: true, text: GUARD }, 'w1'),
+        call('Edit', { file_path: '/p/b.ts', old_string: 'a', new_string: 'b' }, { isError: true, text: 'String to replace not found in file.' }, 'e1'),
+        call('Read', { file_path: '/p/missing' }, { isError: true, text: 'File does not exist.' }, 'r1'),
+        call('Read', { file_path: '/p/a.ts' }, { text: 'body' }, 'r2'),
+      ),
+    ],
+    OPTS,
+  )
+  expect(section(facts, 'Files touched')).toEqual(['- /p/a.ts  R1'])
+  expect(section(facts, 'Failed commands and errors')).toEqual([
+    `- #1 Write: /m/memory/note.md → ${GUARD}`,
+    '- #1 Edit: /p/b.ts → String to replace not found in file.',
+    '- #1 Read: /p/missing → File does not exist.',
+  ])
+})
+
+test('files touched: a shell write a hook blocked is not a file touched; one that ran and then failed still is (0.2.10)', () => {
+  // regression: `cat > …/gen.py` blocked by a guard hook was listed as S1
+  const facts = buildFacts(
+    [
+      asst(
+        call('Bash', { command: 'cat > /tmp/x/gen.py <<EOF\nprint(1)\nEOF' }, { isError: true, text: 'PreToolUse:Bash hook error: [guard]: redirect outside the research folder' }, 'b1'),
+        call('Bash', { command: "sed -i 's/a/b/' /p/c.py && python3 /p/c.py" }, { isError: true, text: 'Exit code 1\nValueError: tab' }, 'b2'),
+      ),
+    ],
+    OPTS,
+  )
+  expect(section(facts, 'Files touched')).toEqual(['- /p/c.py  S1'])
+})
+
+test('firstErrorLine: a shell error beats file content that mentions errors (0.2.10)', () => {
+  // regression: a notes file printed by `cat` was shown instead of the `ls` error
+  const out = [
+    'Exit code 2',
+    '- Check: review the notes before the next run',
+    'build.log',
+    "ls: cannot access '/h/tools/build.py': No such file or directory",
+    '/h2/tools/build.py',
+  ].join('\n')
+  expect(firstErrorLine(out)).toBe("ls: cannot access '/h/tools/build.py': No such file or directory")
+  expect(firstErrorLine('Exit code 127\nnotes about a failed run\nbash: foo: command not found')).toBe('bash: foo: command not found')
+  // one error line is still found as before
+  expect(firstErrorLine('Exit code 1\nnpm ERR! missing script')).toBe('npm ERR! missing script')
+  expect(firstErrorLine('Exit code 1\n\ncollected 3\nE   AssertionError: 2 != 3\nFAILED t.py')).toBe('E   AssertionError: 2 != 3')
+})
+
+// regression: `…; diff before after && echo SAME` exited 1 because the files differed
+const DIFFED = "Exit code 1\n5:(2) ranks\nEXIT=0\n2c2\n< 'q one' | 14 | 14\n---\n> 'q one' | 14 | 9"
+const DIFF_CMD = 'cd /p && grep -n "rank\\|RANK" a.py | head -12; S=/s; python3 run.py > $S/after.txt 2>&1; echo EXIT=$?; diff $S/before.txt $S/after.txt && echo SAME'
+
+test('noMatchExit: exit 1 from a last grep, rg, diff or cmp with other output and no error line (0.2.10)', () => {
+  expect(noMatchExit(DIFF_CMD, DIFFED)).toBe(true)
+  expect(noMatchExit('make build; grep -n foo out.log', 'Exit code 1\nbuilt 3 targets')).toBe(true)
+  expect(noMatchExit('ls /p | rg x', 'Exit code 1\na')).toBe(true)
+  // the whole command was the grep, and it found nothing: still a failure
+  expect(noMatchExit('grep -n foo a.py', 'Exit code 1')).toBe(false)
+  // an error line means something else failed
+  expect(noMatchExit('cat a; grep x b', 'Exit code 1\ngrep: b: No such file or directory')).toBe(false)
+  // exit 2 is grep's own error; a last command that is not a match tool is a failure
+  expect(noMatchExit('cat a; grep x b', 'Exit code 2\nhello')).toBe(false)
+  expect(noMatchExit('grep x a; python3 t.py', 'Exit code 1\nhello')).toBe(false)
+  // a `|` inside the grep pattern's quotes does not end it
+  expect(noMatchExit('cat a; grep -n "x\\|y | z" b', 'Exit code 1\nhello')).toBe(true)
+})
+
+test('failed commands: a compound command whose only failure is a last diff or grep with no match is not failed (0.2.10)', () => {
+  const facts = buildFacts(
+    [
+      asst(
+        call('Bash', { command: DIFF_CMD }, { isError: true, text: DIFFED }, 'b1'),
+        call('Bash', { command: 'grep -n foo a.py' }, { isError: true, text: 'Exit code 1' }, 'b2'),
+      ),
+    ],
+    OPTS,
+  )
+  expect(section(facts, 'Failed commands and errors')).toEqual(['- #1 Bash: grep -n foo a.py → Exit code 1; no output'])
 })

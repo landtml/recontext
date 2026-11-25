@@ -125,9 +125,17 @@ function named(units: readonly Unit[], texts: readonly string[], current?: strin
   }
   const out = new Map<number, string[]>()
   if (want.size === 0) return out
-  const add = (index: number, key: string) => out.set(index, [...new Set([...(out.get(index) ?? []), ...want.get(key)!])])
+  // the order the refs were named in: the first MAX_PINNED are the ones that stay (0.2.10)
+  const order = new Map([...want.keys()].map((key, i) => [key, i]))
+  const first = new Map<number, number>()
+  const add = (index: number, key: string) => {
+    out.set(index, [...new Set([...(out.get(index) ?? []), ...want.get(key)!])])
+    first.set(index, Math.min(first.get(index) ?? Infinity, order.get(key)!))
+  }
   const found = new Set<string>()
   units.forEach((u, index) => {
+    // a ref names a long result's first part only (0.2.9): later parts come in by their words, so 8 parts cannot fill the evidence
+    if (u.part !== undefined) return
     // a ref may cite a tool's result line, which has no unit of its own: it names the call
     for (const n of [u.n, u.resultN]) {
       const key = `${u.session}|${u.k}|${n}`
@@ -149,7 +157,7 @@ function named(units: readonly Unit[], texts: readonly string[], current?: strin
       if (u.session === session && String(u.k) === k && u.n === last && u.tool !== undefined) add(index, key)
     })
   }
-  return new Map([...out].sort((a, b) => a[0] - b[0]))
+  return new Map([...out].sort((a, b) => first.get(a[0])! - first.get(b[0])! || a[0] - b[0]))
 }
 
 /**
@@ -157,6 +165,11 @@ function named(units: readonly Unit[], texts: readonly string[], current?: strin
  * the question's words), the caller's leads (counted twice), identifiers in the question, and
  * exact quoted phrases, after the messages the question or leads name by ref (0.2.4). No list with a hit: [] (abstain).
  */
+/** Most units a question can name by ref and get on top of the ranked hits. */
+const MAX_PINNED = 4
+/** Ranked hits a search returns by default, and the hits whose neighbours come before any extra hit. */
+export const RANKED_HITS = 8
+
 export function search(
   units: readonly Unit[],
   q: { question: string; leads?: readonly string[] },
@@ -181,11 +194,21 @@ export function search(
   }
   // a message named by ref is the strongest lead there is: it goes first, whatever the words say
   const pinned = named(units, [q.question, ...(q.leads ?? [])], opts.currentSession)
-  const rest = [...fused.entries()].filter(([index]) => !pinned.has(index)).sort((a, b) => b[1] - a[1] || tie(a[0], b[0]))
-  return [...[...pinned.keys()].map((index): [number, number] => [index, 1]), ...rest]
-    .slice(0, opts.top ?? 8)
+  // a named unit past the first MAX_PINNED is not lost: it competes in the ranking like any other
+  const kept = new Set([...pinned.keys()].slice(0, MAX_PINNED))
+  const rest = [...fused.entries()].filter(([index]) => !kept.has(index)).sort((a, b) => b[1] - a[1] || tie(a[0], b[0]))
+  // named units sit on top of the ranked list, not inside it: up to MAX_PINNED, in the order named (0.2.10)
+  // a text archived twice (a kept message seen by two shrinks) is shown once, at its best rank (0.2.10)
+  const texts = new Set([...kept].map(index => units[index]!.text))
+  const uniq = rest.filter(([index]) => {
+    const text = units[index]!.text
+    if (texts.has(text)) return false
+    texts.add(text)
+    return true
+  })
+  return [...[...kept].map((index): [number, number] => [index, 1]), ...uniq.slice(0, opts.top ?? RANKED_HITS)]
     .map(([index, score]): Hit => {
-      const as = pinned.get(index)
+      const as = kept.has(index) ? pinned.get(index) : undefined
       return { unit: units[index]!, score, ...(as ? { named: as } : {}) }
     })
 }
@@ -196,11 +219,13 @@ const UNIT_WRAP_TOKENS = 60
 
 /**
  * Evidence for the hits: the hits themselves by rank, then the other units of the same message, then
- * neighbours at distance 1..3 in the same session and reset, until `maxChars` of text. Nothing goes past
+ * neighbours at distance 1..3 in the same session and reset, until `maxChars` of text. Hits past the first
+ * `core` (the extra slots pinned refs add, 0.2.10) come after all that, each only if it fits. Nothing goes past
  * `ceilingTokens` (design 4.3), hits included, except the first hit. Ordered by the session's first hit,
  * then k, n and ref.
  */
-export function expand(units: readonly Unit[], hits: readonly Hit[], maxChars: number, ceilingTokens = Infinity): Unit[] {
+export function expand(units: readonly Unit[], all: readonly Hit[], maxChars: number, ceilingTokens = Infinity, core = Infinity): Unit[] {
+  const hits = all.slice(0, core)
   const chosen = new Set<Unit>()
   let total = 0
   let tokens = 0
@@ -223,7 +248,7 @@ export function expand(units: readonly Unit[], hits: readonly Hit[], maxChars: n
       const ns = d === 0 ? [h.unit.n] : [h.unit.n - d, h.unit.n + d]
       for (const n of ns) {
         for (const u of byPlace.get(`${h.unit.session}|${h.unit.k}|${n}`) ?? []) {
-          if (chosen.has(u)) continue
+          if (chosen.has(u) || u.part !== undefined) continue // parts of a long result come in only as hits (0.2.9)
           if (total + u.text.length > maxChars || tokens + unitTokens(u) > ceilingTokens) break outer
           chosen.add(u)
           total += u.text.length
@@ -231,6 +256,13 @@ export function expand(units: readonly Unit[], hits: readonly Hit[], maxChars: n
         }
       }
     }
+  }
+  for (const h of all.slice(hits.length)) {
+    if (chosen.has(h.unit) || total + h.unit.text.length > maxChars || tokens + unitTokens(h.unit) > ceilingTokens) continue
+    chosen.add(h.unit)
+    shown.push(h)
+    total += h.unit.text.length
+    tokens += unitTokens(h.unit)
   }
   const sessionOrder = new Map<string, number>()
   for (const h of shown) if (!sessionOrder.has(h.unit.session)) sessionOrder.set(h.unit.session, sessionOrder.size)

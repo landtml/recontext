@@ -75,7 +75,13 @@ function engine(
   on('fs.exists', (_, e) => ({ value: w.writes.has(e.path) }))
   on('fs.read', (_, e) => {
     const text = w.writes.get(e.path)
-    return text === undefined ? { deny: `ENOENT: ${e.path}` } : { value: text }
+    if (text === undefined) return { deny: `ENOENT: ${e.path}` }
+    const from = e.offset ?? 0
+    return { value: e.offset !== undefined || e.length !== undefined ? text.slice(from, e.length !== undefined ? from + e.length : undefined) : text }
+  })
+  on('fs.stat', (_, e) => {
+    const text = w.writes.get(e.path)
+    return text === undefined ? { deny: `ENOENT: ${e.path}` } : { value: { kind: 'file' as const, size: text.length, mtimeMs: 0, isLink: false } }
   })
   on('fs.list', (_, e) => {
     const names = [...w.writes.keys()].filter(k => k.startsWith(`${e.path}/`)).map(k => k.slice(e.path.length + 1).split('/')[0]!)
@@ -248,7 +254,7 @@ const start = async ($: { session: { start: (e: { cwd: string; surface: null; is
 
 test('session.start registers the recall tool, shown up front, with a question and leads', async ($, on) => {
   const w = engine(on)
-  await start($, on, 180_000)
+  await start($, on, 200_000)
   expect(w.registered).toHaveLength(1)
   expect(w.registered[0]).toMatchObject({ name: 'recall', isDeferred: false })
   const schema = (w.registered[0] as { inputSchema: { required: string[]; properties: Record<string, unknown> } }).inputSchema
@@ -483,4 +489,40 @@ test('recall: no wider read when the first read already held everything, or when
   const w = engine(on, { files: shardFiles() })
   expect(await recall($, 'How many invoices were in batches 1-2?')).toStartWith('Not found in the archived conversation')
   expect(w.asks).toHaveLength(1)
+})
+
+// ---------------------------------------------------------------- messages queued mid-turn (0.2.9)
+
+const queuedRow = (text: string) =>
+  JSON.stringify({
+    type: 'attachment',
+    isSidechain: false,
+    attachment: { type: 'queued_command', prompt: [{ type: 'image', source: {} }, { type: 'text', text }], origin: { kind: 'human' }, timestamp: '2026-11-24T11:59:00.000Z' },
+  })
+const assistantRow = JSON.stringify({ type: 'assistant', isSidechain: false, message: { content: [] } })
+
+test('a message queued mid-turn is carried: top of the handoff, archive and facts (0.2.9)', async ($, on) => {
+  const w = engine(on, { files: { [TRANSCRIPT]: [assistantRow, queuedRow('and check the parser too'), ''].join('\n') } })
+  const out = messagesOf(await compact($))
+  const handoff = out[0]!.text
+  const section = '## Sent while Claude was working, not yet answered\nand check the parser too\n[1 image attached: not carried]'
+  expect(handoff).toContain(section)
+  expect(handoff.indexOf(section)).toBeLessThan(handoff.indexOf('## State of work'))
+  expect(w.writes.get(`${DIR}/archive/${NAME}.txt`)).toContain(`#${INPUT.length + 1} user | and check the parser too`)
+  expect(w.toasts).toEqual([`shrink: shrink 1 saved to ${DIR}/session-handoff_${NAME}.md`])
+})
+
+test('a queued message that an assistant row followed, or that a handed message holds, is not carried (0.2.9)', async ($, on) => {
+  const w = engine(on, {
+    files: { [TRANSCRIPT]: [queuedRow('seen already'), assistantRow, queuedRow('and add tests'), ''].join('\n') },
+  })
+  const out = messagesOf(await compact($))
+  expect(out[0]!.text).not.toContain('Sent while Claude was working')
+})
+
+test('no transcript to read: the shrink is as before, and no problem reported (0.2.9)', async ($, on) => {
+  const w = engine(on)
+  const out = messagesOf(await compact($))
+  expect(out[0]!.text).not.toContain('Sent while Claude was working')
+  expect(w.toasts).toEqual([`shrink: shrink 1 saved to ${DIR}/session-handoff_${NAME}.md`])
 })

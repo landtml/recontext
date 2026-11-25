@@ -178,3 +178,68 @@ test('expand: the token ceiling holds even when many hits are named; the first h
   expect(out[0]!.ref).toBe('s1-1#1')
   expect(expand(units, hits.slice(0, 1), 1_000_000, 10).map(u => u.ref)).toEqual(['s1-1#1'])
 })
+
+test('a ref to a long result names its first part only; later parts are found by their words (0.2.9)', () => {
+  const units = [
+    unit(3, 'Bash: gh release --help\nUSAGE gh release', { kind: 'tool', tool: 'Bash', ref: 's1-1#3.1' }),
+    unit(3, 'Bash (part 2 of 3): gh release --help\nFLAGS --notes-file', { kind: 'tool', tool: 'Bash', ref: 's1-1#3.1p2', part: 2 }),
+    unit(3, 'Bash (part 3 of 3): gh release --help\nFLAGS --verify-tag', { kind: 'tool', tool: 'Bash', ref: 's1-1#3.1p3', part: 3 }),
+    unit(5, 'later text'),
+  ]
+  const hits = search(units, { question: 'what did #3 print?' }, { currentSession: 's1' })
+  expect(hits.filter(h => h.named?.length).map(h => h.unit.ref)).toEqual(['s1-1#3.1'])
+  expect(search(units, { question: 'which flag is --verify-tag' }, { currentSession: 's1' })[0]!.unit.ref).toBe('s1-1#3.1p3')
+})
+
+test('expand: later parts of a long result come in only as hits, never as neighbours (0.2.9)', () => {
+  const units = [
+    unit(3, 'Bash: cat big\nhead of it', { kind: 'tool', tool: 'Bash', ref: 's1-1#3.1' }),
+    unit(3, `Bash (part 2 of 3): cat big\n${'p'.repeat(8000)}`, { kind: 'tool', tool: 'Bash', ref: 's1-1#3.1p2', part: 2 }),
+    unit(3, `Bash (part 3 of 3): cat big\n${'q'.repeat(8000)} needle`, { kind: 'tool', tool: 'Bash', ref: 's1-1#3.1p3', part: 3 }),
+    unit(4, 'the reply after it'),
+  ]
+  const fromFirst = expand(units, [{ unit: units[0]!, score: 1 }], 60000)
+  expect(fromFirst.map(u => u.ref)).toEqual(['s1-1#3.1', 's1-1#4'])
+  const fromPart = expand(units, [{ unit: units[2]!, score: 1 }], 60000)
+  expect(fromPart.map(u => u.ref)).toEqual(['s1-1#3.1', 's1-1#3.1p3', 's1-1#4'])
+})
+
+test('search: a pinned unit does not take a ranked slot (0.2.10)', () => {
+  const units = [unit(1, 'unrelated opening note'), ...Array.from({ length: 10 }, (_, i) => unit(i + 3, `parser crash number ${i}`))]
+  const hits = search(units, { question: 'why did the parser crash, see #1' }, { currentSession: 's1' })
+  expect(hits).toHaveLength(9)
+  expect(hits[0]!.unit.ref).toBe('s1-1#1')
+  expect(hits[0]!.named).toEqual(['#1'])
+  expect(hits.slice(1).every(h => h.unit.text.startsWith('parser crash'))).toBe(true)
+})
+
+test('search: at most 4 pinned units, in the order named (0.2.10)', () => {
+  const named = [21, 23, 25, 27, 29, 31].map(n => unit(n, `note ${n}`))
+  const ranked = Array.from({ length: 10 }, (_, i) => unit(i + 1, `parser crash number ${i}`))
+  const hits = search([...ranked, ...named], { question: 'parser crash at #27 #21 #31 #23 #25 #29', leads: ['parser crash'] }, { currentSession: 's1' })
+  expect(hits.slice(0, 4).map(h => h.unit.n)).toEqual([27, 21, 31, 23])
+  expect(hits).toHaveLength(12)
+  expect(hits.slice(4).every(h => h.named === undefined && h.unit.text.startsWith('parser crash'))).toBe(true)
+})
+
+test('search: a text archived twice is shown once, at its best rank (0.2.10)', () => {
+  const twice = 'Bash: bun test\n12 pass parser crash fixed'
+  const units = [
+    unit(4, twice, { ref: 's1-1#4.1', kind: 'tool', tool: 'Bash' }),
+    unit(2, twice, { ref: 's1-2#2.1', k: 2, kind: 'tool', tool: 'Bash' }),
+    ...Array.from({ length: 8 }, (_, i) => unit(i + 10, `parser crash note ${i}`)),
+  ]
+  const hits = search(units, { question: 'parser crash fixed?', leads: ['parser crash'] }, { currentSession: 's1' })
+  expect(hits.filter(h => h.unit.text === twice)).toHaveLength(1)
+  expect(hits).toHaveLength(8)
+})
+
+test('expand: hits past the core come after the neighbours, and only if they fit (0.2.10)', () => {
+  const units = [unit(1, 'a'.repeat(100)), unit(2, 'b'.repeat(100)), unit(3, 'c'.repeat(100)), unit(9, 'z'.repeat(150))]
+  const hits = [units[1]!, units[3]!].map(u => ({ unit: u, score: 1 }))
+  // core 1: the neighbours of the first hit fill the budget before the extra hit is tried
+  expect(expand(units, hits, 300, Infinity, 1).map(u => u.n)).toEqual([1, 2, 3])
+  expect(expand(units, hits, 450, Infinity, 1).map(u => u.n)).toEqual([1, 2, 3, 9])
+  // no core given: every hit first, as before
+  expect(expand(units, hits, 300, Infinity).map(u => u.n)).toEqual([2, 9])
+})

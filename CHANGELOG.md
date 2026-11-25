@@ -3,8 +3,37 @@
 The project was renamed from claude-shrink-compaction to Recontext with 0.2.8. The plugin is still called
 `shrink`, so `/shrink`, `/shrink now` and the `recall` tool keep their names.
 
-Versions 0.2.0 to 0.2.8 also had local logging used during development. It is not part of the public
+Versions 0.2.0 to 0.2.10 also had local logging used during development. It is not part of the public
 release and is left out of these notes.
+
+## 0.2.10
+
+- The digest gives some tool calls a short result line under the call: Bash, Agent, AskUserQuestion, Skill
+  and MCP tools. It holds a test summary, the first failure line, or the last line of output (at most 100
+  characters), so Haiku can tell that a call ran and what it returned. Read-only shell commands (`cat`, `grep`,
+  `ls` and the like) get none. When the digest is over budget, result lines are dropped first.
+- State-of-work prompt (rev 6): it explains result lines, and Haiku never cites "Previous state" as a source,
+  since the next reader never sees it.
+- Facts: a Write, Edit or Read that failed, or a shell write that a hook blocked, is not listed as a file
+  touched. A shell's own error line wins over printed text that only mentions errors. Exit 1 from a last
+  `grep`, `rg`, `diff` or `cmp` that printed other output (no match, files differ) is not a failed command.
+- Refs: a dropped ref leaves no empty or filler-only brackets behind (`(see #42)` goes entirely).
+- Recall: units named in the question or the leads (`#n`, `#k:n`) come first, up to 4, ahead of the ranked hits.
+
+## 0.2.9
+
+- Messages you send while Claude is working, which Claude has not seen yet when a shrink runs, are no longer
+  lost. They open the handoff word for word under "Sent while Claude was working, not yet answered", and go
+  into the archive and the index. Attached images are noted, not carried.
+- Facts: answers you gave through AskUserQuestion count as your words; files changed by shell commands are
+  listed (marked `S`); a failed command with no error text shows its exit code and last line. New sections:
+  "Commands that worked" (repeated successful commands, side effects and secrets left out) and "Names in play"
+  (identifiers in use). The "Files to re-read" list drops entries that are not paths. `factsBudgetChars` now
+  defaults to 14000.
+- Recall: written file content and long tool results are indexed in full, in up to 8 parts. The number check
+  accepts a number found in the evidence the same sentence cites, treats version strings and clock times as
+  one value, and quotes match text whose JSON escapes are decoded.
+- Paths accept `\` as well as `/`, and the home folder falls back to `USERPROFILE`. Windows is still untested.
 
 ## 0.2.8
 

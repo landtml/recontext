@@ -84,7 +84,11 @@ export function parseDraft(text: string): Draft | undefined {
 }
 
 const MARKER = /\[(E\d+)\]/g
-const NUMBER = /\d[\d,]*(?:\.\d+)?/g
+/** A value: a version string (0.2.5) or clock time (01:30:10) as one token, else a number like 4,306 or 0.70 (0.2.9). */
+const NUMBER_SRC = String.raw`\d+(?:\.\d+){2,}|\d{1,2}:\d{2}(?::\d{2})?|\d[\d,]*(?:\.\d+)?`
+const NUMBER = new RegExp(NUMBER_SRC, 'g')
+/** A value with the letters written right after it ("35ms", "2m"), as one source must hold it. */
+const VALUE = new RegExp(`(${NUMBER_SRC})([A-Za-z%]*)`, 'g')
 const normalize = (s: string): string => s.replace(/\s+/g, ' ').trim()
 const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
@@ -93,12 +97,33 @@ const IDENTIFIER = /[A-Za-z_][\w\-./]*?\d[\w\-./]*/g
 /** "1." or "2)" opening a line: list numbering, not a value. */
 const LIST_NUMBER = /^[ \t]*\d+[.)](?=\s)/gm
 
-/** The values in a text, for G3. Identifiers, markers and list numbering are not values. */
+/** A text without what is not a value: evidence markers, identifiers and (unless `asSource`) list numbering. */
+function valueText(text: string, asSource: boolean): string {
+  const unlabeled = text.replace(MARKER, ' ').replace(IDENTIFIER, ' ')
+  return asSource ? unlabeled : unlabeled.replace(LIST_NUMBER, ' ')
+}
+
 /** The values in a text. `asSource`: a quote's numbers all count, a leading "2." too, as the quote holds it (0.2.4). */
 function numbers(text: string, asSource = false): Set<string> {
-  const unlabeled = text.replace(MARKER, ' ').replace(IDENTIFIER, ' ')
-  const plain = asSource ? unlabeled : unlabeled.replace(LIST_NUMBER, ' ')
-  return new Set((plain.match(NUMBER) ?? []).map(n => n.replace(/,/g, '')))
+  return new Set((valueText(text, asSource).match(NUMBER) ?? []).map(n => n.replace(/,/g, '')))
+}
+
+/** The text holds this value (number plus attached letters) as a whole token, with or without its commas. */
+function holdsValue(text: string, raw: string): boolean {
+  const forms = new Set([raw, raw.replace(/,/g, '')])
+  return [...forms].some(f => new RegExp(`(?<![\\w.,:])${escapeRe(f)}(?![\\w]|[.,:]\\d)`).test(text))
+}
+
+/** JSON string escapes decoded: units hold tool inputs as JSON, so a quote of the prompt sees \n, not a newline (0.2.9). */
+const unescapeJson = (s: string): string =>
+  s.replace(/\\(["\\/nt])/g, (_, c: string) => (c === 'n' ? '\n' : c === 't' ? '\t' : c))
+
+/** The answer's sentences, each with the evidence ids it cites. */
+function sentences(answer: string): { text: string; ids: string[] }[] {
+  return answer
+    .split(/(?<=[.!?])\s+|\n+/)
+    .filter(t => t.trim() !== '')
+    .map(text => ({ text, ids: [...text.matchAll(MARKER)].map(m => m[1]!) }))
 }
 
 /** The quote appears in the text on whole tokens (not inside a longer word or number). */
@@ -118,6 +143,7 @@ export function checkDraft(d: Draft, evidence: readonly Evidence[], question = '
   if (d.abstain) return []
   const byId = new Map(evidence.map(e => [e.id, e]))
   const cited = new Set(d.citations.map(c => c.id))
+  const isCited = (id: string): boolean => cited.has(id) && byId.has(id)
   const failures: string[] = []
   if (d.answer.trim() === '') failures.push('G1:empty_answer')
   if (d.citations.length === 0) failures.push('G1:no_citation')
@@ -127,10 +153,26 @@ export function checkDraft(d: Draft, evidence: readonly Evidence[], question = '
     const e = byId.get(c.id)
     if (!e) continue
     const q = normalize(c.quote)
-    if (q === '' || !quoteFound(q, normalize(e.unit.text))) failures.push(`G2:quote_not_found:${c.id}`)
+    if (q === '' || !(quoteFound(q, normalize(e.unit.text)) || quoteFound(q, normalize(unescapeJson(e.unit.text)))))
+      failures.push(`G2:quote_not_found:${c.id}`)
   }
+  // G3: a value is sourced by the question, by any quote, or (0.2.9) by the text of a unit its own sentence cites;
+  // an answer with no [En] marker at all (most real drafts) cites its whole citation list in every sentence
   const sourced = new Set([...numbers(question, true), ...d.citations.flatMap(c => [...numbers(c.quote, true)])])
-  for (const n of [...numbers(d.answer)].sort()) if (!sourced.has(n)) failures.push(`G3:number_unsourced:${n}`)
+  const unsourced = new Set<string>()
+  const parts = sentences(d.answer.replace(LIST_NUMBER, ' '))
+  const marked = parts.some(s => s.ids.length > 0)
+  for (const s of parts) {
+    const ids = marked ? s.ids : [...cited]
+    const texts = ids.flatMap(id => (isCited(id) ? [byId.get(id)!.unit.text] : []))
+    for (const m of valueText(s.text, true).matchAll(VALUE)) {
+      const n = m[1]!.replace(/,/g, '')
+      if (sourced.has(n)) continue
+      if (texts.some(t => holdsValue(t, m[0]))) continue
+      unsourced.add(n)
+    }
+  }
+  for (const n of [...unsourced].sort()) failures.push(`G3:number_unsourced:${n}`)
   return [...new Set(failures)]
 }
 
