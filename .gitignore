@@ -1,0 +1,16 @@
+# Written by Claude Code when it loads the mod (API types for the editor and tsc)
+.claude-plugin/types/
+
+# Fixtures made from your own transcripts with tools/fixture.py: they hold real conversations, never commit them
+fixtures/local-*
+
+# OS, editors, logs
+.DS_Store
+*~
+*.swp
+*.log
+node_modules/
+
+# Blender output: holds local paths
+*.blend
+*.blend1

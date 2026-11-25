@@ -1,0 +1,95 @@
+{
+  "name": "shrink",
+  "version": "0.2.8",
+  "description": "Token-efficient, low-loss context compaction for Claude Code: a script prunes the transcript, Haiku distills it instead of the session model, and a recall tool answers exact questions about the compacted conversation from a local archive.",
+  "icon": "./assets/logo.png",
+  "author": {
+    "name": "landtml"
+  },
+  "homepage": "https://github.com/landtml/recontext",
+  "repository": "https://github.com/landtml/recontext",
+  "license": "MIT",
+  "keywords": [
+    "compaction",
+    "context",
+    "handoff",
+    "recall",
+    "haiku",
+    "context-engineering"
+  ],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "mode": {
+      "type": "string",
+      "title": "Shrink mode",
+      "description": "haiku: Haiku writes the state of work from a pruned digest. code: no model call at the shrink (facts only).",
+      "default": "haiku"
+    },
+    "shrinkModel": {
+      "type": "string",
+      "title": "Shrink and recall model",
+      "description": "Model alias or id for the state of work and for recall answers.",
+      "default": "haiku"
+    },
+    "handoffDir": {
+      "type": "string",
+      "title": "Handoff folder",
+      "description": "Where handoffs, archives and index shards go. Empty: <project's Claude folder>/handoffs, next to the transcript.",
+      "default": ""
+    },
+    "digestChars": {
+      "type": "number",
+      "title": "Digest cap (chars, override)",
+      "description": "Off by default (0): the token budget below decides what Haiku reads. Set it to cap the digest anyway; older lines are dropped first.",
+      "default": 0
+    },
+    "haikuBudgetTokens": {
+      "type": "number",
+      "title": "Haiku budget (tokens)",
+      "description": "Most input tokens one Haiku call may take, estimated at 2 chars per token (measured 2.0-2.4). A larger shrink is split into up to 6 parts plus a merge; recall reads only what fits. Keep it under 100000, where Haiku moves to its higher price.",
+      "default": 80000
+    },
+    "stateEffort": {
+      "type": "string",
+      "title": "State writer effort",
+      "description": "Reasoning effort for the state of work: low, medium, high or xhigh. Medium by default: in a replay of 13 recorded shrinks, high made no fewer errors at about twice the output tokens. A timed-out call above medium is retried once at medium.",
+      "default": "medium"
+    },
+    "mapEffort": {
+      "type": "string",
+      "title": "Part note-taker effort",
+      "description": "Reasoning effort for the note-takers on older parts of a large shrink.",
+      "default": "medium"
+    },
+    "recallEffort": {
+      "type": "string",
+      "title": "Recall reader effort",
+      "description": "Reasoning effort for the recall reader.",
+      "default": "medium"
+    },
+    "factsBudgetChars": {
+      "type": "number",
+      "title": "Facts budget (chars)",
+      "description": "Size limit of the exact facts in the handoff message.",
+      "default": 12000
+    },
+    "tailChars": {
+      "type": "number",
+      "title": "Kept tail (chars)",
+      "description": "Size limit of the last messages kept word for word after a shrink.",
+      "default": 24000
+    },
+    "recallScope": {
+      "type": "string",
+      "title": "Recall scope",
+      "description": "session: only this session's shrunk conversation. project: also this project's other sessions.",
+      "default": "project"
+    },
+    "thresholdWarnAbove": {
+      "type": "number",
+      "title": "Warn above threshold",
+      "description": "At session start, toast if the auto-compact threshold is missing or above this many tokens.",
+      "default": 200000
+    }
+  }
+}

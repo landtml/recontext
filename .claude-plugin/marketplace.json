@@ -1,0 +1,13 @@
+{
+  "name": "recontext",
+  "owner": {
+    "name": "landtml"
+  },
+  "plugins": [
+    {
+      "name": "shrink",
+      "source": "./",
+      "description": "Token-efficient, low-loss context compaction for Claude Code: a script prunes, Haiku distills, and recall brings back exact details from the archive."
+    }
+  ]
+}
