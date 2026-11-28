@@ -30,18 +30,12 @@
 
 ---
 
-## Abstract
+## At a glance
 
-Claude Code compacts a long conversation by asking the session's model to read all of it and write a summary.
-Recontext replaces that step. Code splits and prunes the conversation, Haiku writes a short state of work from
-the pruned digest, and code adds exact facts and keeps the most recent messages word for word. The session
-model is never called. The full conversation is kept in a local archive, and a `recall` tool answers questions
-about it with quotes that code checks word for word. Every Haiku call stays under a token budget (80k by
-default), below Haiku's higher price tier, and any error falls back to the built-in compaction.
-
-Measured per shrink: 5–22k Haiku input tokens and 8–19 seconds. In a code-only replay of 91 shrinks, the
-handoff held 90.4% of the exact items the session needed afterwards, and exact lookup reached the remaining
-items without a model call (1,769 of 1,769).
+When a Claude Code conversation gets too long, Claude Code compacts it: the session's model reads everything and
+writes a summary. Recontext does this job instead, in a more token-efficient way. Code and Haiku write a short handoff,
+the session model is never called, and nothing is thrown away: the full conversation stays in a local archive that
+Claude can search with the `recall` tool. If anything goes wrong, the built-in compaction runs as before.
 
 ```
 shrink ▸ context 82k / 100k ▓▓▓▓▓▓▓▓░░ · 2 shrinks (Haiku, ~3 s each) · 3 recalls (2 answered)
