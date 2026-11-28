@@ -280,6 +280,103 @@ To fit the value to your own work, measure F and g from your sessions and put th
 `autoCompactWindow` to about T* + 33000, but not below `100000`. Run `python3 assets/economics.py` to redraw
 the diagrams. The inputs are at the top of the file.
 
+## Virtual context window and recall
+
+A model can only reason over the tokens in its context window. Recontext does not make that window larger. It
+gives the session a second, much larger space that the model can reach on demand. This design is called a
+*virtual context window*, after virtual memory in an operating system. The term and the idea come from MemGPT
+([Packer et al., 2023](https://arxiv.org/abs/2310.08560)).
+
+### Two windows
+
+| | Active context | Virtual context window |
+|---|---|---|
+| What it is | the tokens the model reads on this turn | everything the session has produced, before and after every shrink |
+| Size | below the threshold (100k recommended) | grows without a limit, one archive per shrink |
+| How the model uses it | directly, on every turn | through `recall`, one tool call per question |
+| Cost | re-read on every turn | free until it is used; a `recall` costs one small Haiku call, or none |
+
+Let A<sub>n</sub> be the active context after shrink n, and B<sub>i</sub> the context size just before shrink i. Each
+shrink moves B<sub>i</sub> − A<sub>i</sub> tokens out of the active context into the archive, where they stay
+reachable. The virtual window after n shrinks is therefore
+
+$$V_n = A_n + \sum_{i=1}^{n} (B_i - A_i)$$
+
+The active context stays in a band, while V<sub>n</sub> grows by about one shrink's worth each time. In the
+longest session measured, 61 shrinks each took the context from a median of 121k down to 50k. The model never
+read more than about 170k tokens at once, but at the end about 4.5M tokens were reachable: some 22 times a 200k
+window.
+
+<p align="center"><picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/recall-window-dark.svg">
+  <img src="assets/recall-window-light.svg" alt="On a log scale, the active context saws between 50k and 121k over 61 shrinks, while the virtual window climbs past a 200k real window to about 4.5M tokens" width="100%">
+</picture></p>
+
+### Tiers
+
+As in a computer's memory, each level is larger and slower to reach than the one above it.
+
+| Tier | Holds | Reached by | Cost to reach |
+|---|---|---|---|
+| T0 recent | the last messages, word for word | reading | none, already in context |
+| T1 handoff | state of work, exact facts, a ranked slice of the session index | reading | none, already in context |
+| T2 session index | every path, file, id, command and name the session used, with archive refs | `recall` exact lookup | code only, no model call |
+| T3 archive | every message, one line each | `recall` search | one Haiku call under the 80k budget |
+
+### Recall
+
+Recall is what happens when the model needs something that is not in its active context, much like a page fault.
+The model calls `recall` with a question. Code first looks the question up in the session index (T2). If an item
+named in the question is there, its archive lines are the answer and no model is called. Otherwise code searches
+the archive (T3), and Haiku answers from the passages it finds. Code then checks every quote in the answer word
+for word against the archive. An answer whose quotes do not check is returned as the raw passages, marked
+unverified, so the model never sees an invented quote.
+
+Two rates describe how well this works. For a set N of exact items (paths, ids, names, numbers) that the session
+needs after a shrink:
+
+$$\text{held} = \frac{|N \cap (\text{T0} \cup \text{T1})|}{|N|} \qquad\qquad \text{reachable} = \frac{|N \cap (\text{T0} \cup \text{T1} \cup \text{T2})|}{|N|}$$
+
+*Held* is the share the model has without calling anything. *Reachable* adds what exact lookup finds without a
+model call. Measured by replaying 91 shrinks with code only:
+
+| | 0.2.12 | 0.3.0 |
+|---|---|---|
+| held | 50.0% | 90.4% |
+| reachable without a model call | 50.0% | 100.0% (1,769 of 1,769) |
+| handoff size (median) | baseline | baseline + about 4.4k tokens |
+
+<p align="center"><picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/recall-tiers-dark.svg">
+  <img src="assets/recall-tiers-light.svg" alt="Where a needed exact fact is found: 0.2.12 holds 50.0% in the handoff and needs an archive search for the rest; 0.3.0 holds 90.4% and finds the rest by exact lookup" width="100%">
+</picture></p>
+
+### Recall in use
+
+Across 81 `recall` calls in live sessions (all versions), counted from the local log:
+
+| Outcome | Calls | Share |
+|---|---|---|
+| answered with checked quotes | 67 | 83% |
+| raw passages, marked unverified | 8 | 10% |
+| nothing found | 6 | 7% |
+
+The median call took about 10 seconds. A hand-graded random sample of 15 answers found 11 fully correct, 3 partly
+correct and 1 wrong. None contained an invented fact: every error was a false "not in the evidence" about
+something the archive did hold. With 15 answers the 95% interval for the fully-correct rate is wide, about 45% to
+92%, so treat it as a direction, not a precise score. These answers predate 0.3.0's exact lookup.
+
+### What it is not
+
+- **Not a larger real window.** The model still reasons over the active context only. A fact in the archive helps
+  only once `recall` brings it in, and the model has to know to ask.
+- **Not free.** A search costs one Haiku call and a few seconds; the answer then takes space in the active
+  context.
+- **Not perfect.** The weak point is finding the right passages, not inventing facts. A question with no
+  distinctive word or name is the hardest case.
+
+Run `python3 assets/recall.py` to redraw the diagrams. The inputs are at the top of the file.
+
 ## Files it writes
 
 Everything stays on your machine, in `~/.claude/projects/<project>/handoffs/` (or `handoffDir`):
