@@ -18,12 +18,12 @@
 </p>
 
 <p align="center">
-  <a href="#install">Install</a> ·
-  <a href="#how-it-works">How it works</a> ·
-  <a href="#compatibility">Compatibility</a> ·
-  <a href="#configuration">Configuration</a> ·
-  <a href="#choosing-the-threshold">Threshold</a> ·
-  <a href="#limits">Limits</a> ·
+  <a href="#4-install">Install</a> ·
+  <a href="#2-how-it-works">How it works</a> ·
+  <a href="#3-compatibility">Compatibility</a> ·
+  <a href="#6-configuration">Configuration</a> ·
+  <a href="#7-choosing-the-threshold">Threshold</a> ·
+  <a href="#10-limits">Limits</a> ·
   <a href="CHANGELOG.md">Changelog</a> ·
   <a href="CONTRIBUTING.md">Contributing</a>
 </p>
@@ -46,7 +46,34 @@ shrink ▸ context 82k / 100k ▓▓▓▓▓▓▓▓░░ · 2 shrinks (Haiku
 ```
 <sup>The status bar above the prompt: context fill against the shrink point, shrinks so far, recalls answered.</sup>
 
-## Why
+## Contents
+
+- [1 Why](#1-why)
+- [2 How it works](#2-how-it-works)
+- [3 Compatibility](#3-compatibility)
+- [4 Install](#4-install)
+  - [4.1 Turn on automatic shrinking](#41-turn-on-automatic-shrinking)
+- [5 What you see](#5-what-you-see)
+- [6 Configuration](#6-configuration)
+- [7 Choosing the threshold](#7-choosing-the-threshold)
+  - [7.1 The inputs](#71-the-inputs)
+  - [7.2 The cost per turn](#72-the-cost-per-turn)
+  - [7.3 Finding the minimum](#73-finding-the-minimum)
+  - [7.4 The recommendation](#74-the-recommendation)
+- [8 Virtual context window and recall](#8-virtual-context-window-and-recall)
+  - [8.1 Two windows](#81-two-windows)
+  - [8.2 Tiers](#82-tiers)
+  - [8.3 Recall](#83-recall)
+  - [8.4 Recall in use](#84-recall-in-use)
+  - [8.5 What it is not](#85-what-it-is-not)
+- [9 Files it writes](#9-files-it-writes)
+- [10 Limits](#10-limits)
+- [11 Uninstall](#11-uninstall)
+- [12 Development](#12-development)
+- [13 Credits](#13-credits)
+- [14 License](#14-license)
+
+## 1 Why
 
 Claude Code's built-in compaction asks the session's model, often Opus, to read the whole conversation and
 summarize it. At a few hundred thousand tokens that one call is expensive. On a subscription it can take a
@@ -61,7 +88,7 @@ Recontext moves the heavy lifting to code and a small model:
 | Exact details after compaction | only what the summary kept | `recall` fetches them from the archive, with checked quotes |
 | If something fails | n/a | code-only handoff, then the built-in compaction |
 
-## How it works
+## 2 How it works
 
 <p align="center"><img src="assets/architecture.png" alt="Recontext architecture: the shrink pipeline, the archive on disk, and the recall pipeline" width="100%"></p>
 
@@ -97,7 +124,7 @@ recall(question, leads)   a tool Claude calls when it needs a detail from before
 The full design, including the options that were considered and rejected, is in
 [docs/design.md](docs/design.md).
 
-## Compatibility
+## 3 Compatibility
 
 | Where | Works |
 |---|---|
@@ -108,7 +135,7 @@ The full design, including the options that were considered and rejected, is in
 
 Runs on **Linux** and **macOS**. **Windows** is untested.
 
-## Install
+## 4 Install
 
 At the prompt of a Claude Code terminal session:
 
@@ -123,7 +150,7 @@ From a shell, in one step: `claude plugin install shrink --marketplace landtml/r
 In the desktop app: click **+** next to the prompt box → **Plugins** → **Add marketplace**
 (`landtml/recontext`) → **Add plugin**.
 
-### Turn on automatic shrinking
+### 4.1 Turn on automatic shrinking
 
 Recontext does not decide when to compact. Claude Code does, and Recontext replaces what happens at that
 moment. Set it up once and every compaction after that is a shrink, with nothing to run by hand.
@@ -150,7 +177,7 @@ Then start a new session. Settings are read when a session starts, so an open se
    can fetch any exact detail from the archive later.
 
 **Choosing the window.** `133000` (a 100k threshold) is the recommended value. [Choosing the
-threshold](#choosing-the-threshold) shows where it comes from. A larger window compacts less often but sends
+threshold](#7-choosing-the-threshold) shows where it comes from. A larger window compacts less often but sends
 more tokens on every request in between. Claude Code treats any value below `100000` as `100000`.
 
 **If it is off.** With `autoCompactEnabled: false`, nothing compacts on its own. At session start the mod shows a notice when auto-compaction is off or the
@@ -161,7 +188,7 @@ threshold is above `thresholdWarnAbove` (default `200000`).
 
 **Subagents** are shrunk the same way, quietly: no toast and no panel row. Their files carry a `sub…` label.
 
-## What you see
+## 5 What you see
 
 - **A bar above the prompt:** how full the context is against the shrink point, how many shrinks ran (and
   whether Haiku wrote them) and how many recalls answered.
@@ -170,7 +197,7 @@ threshold is above `thresholdWarnAbove` (default `200000`).
 - **After a shrink**, Claude Code shows its usual "Compacted chat" line. The message under it starts with
   `# Handoff (this conversation was shrunk by the shrink mod)`, which is how you know the mod handled it.
 
-## Configuration
+## 6 Configuration
 
 Claude Code shows these options when you install the mod; the defaults work. To see or change them later,
 use the `/config` menu (each option is a row there) or `claude plugin configure shrink` from a shell.
@@ -190,7 +217,7 @@ use the `/config` menu (each option is a row there) or `claude plugin configure 
 | `recallScope` | `project` | `session`: recall searches this session only. `project`: also this project's other sessions. |
 | `thresholdWarnAbove` | `200000` | Notice at session start when the auto-compact threshold is missing or above this. |
 
-## Choosing the threshold
+## 7 Choosing the threshold
 
 The threshold is the context size at which a shrink starts. It is a trade-off. On every turn, Claude Code sends
 the whole conversation again. Prompt caching makes the old part cheap, but not free: each cached token is billed
@@ -198,7 +225,7 @@ at a tenth of the normal input price, on every turn. A large context therefore c
 shrink makes the context small again, but each shrink has a one-off cost. This section works out where the two
 costs balance.
 
-### The inputs
+### 7.1 The inputs
 
 All values are in tokens and were measured from Claude Code session transcripts, using automatic shrinks only
 (77 shrinks, about 5,700 ordinary requests).
@@ -218,7 +245,7 @@ $$C = w\,(E + R) = 20 \times (27.7\text{k} + 0.7\text{k}) \approx 568\text{k}$$
 So one shrink costs about as much as re-reading 568k cached tokens, which is six or seven turns at a 90k context.
 The Haiku call that writes the handoff adds about 1% of that, so it is left out.
 
-### The cost per turn
+### 7.2 The cost per turn
 
 Between two shrinks the context climbs from F to the threshold T, by g per turn. Then it drops back to F.
 
@@ -236,7 +263,7 @@ The new tokens each turn adds are written to the cache whatever T is, so they do
 left out. The first term grows with T, because a higher threshold means a larger context on every turn. The
 second term shrinks with T, because a higher threshold means fewer shrinks.
 
-### Finding the minimum
+### 7.3 Finding the minimum
 
 The total is lowest where its slope is zero:
 
@@ -266,7 +293,7 @@ Compared with the cheapest point:
 | 250k | 117 | +77% |
 | 300k | 145 | +105% |
 
-### The recommendation
+### 7.4 The recommendation
 
 Set `autoCompactWindow` to `133000`. Claude Code keeps a reserve of about 33k, so a shrink starts at 100k.
 
@@ -280,14 +307,14 @@ To fit the value to your own work, measure F and g from your sessions and put th
 `autoCompactWindow` to about T* + 33000, but not below `100000`. Run `python3 assets/economics.py` to redraw
 the diagrams. The inputs are at the top of the file.
 
-## Virtual context window and recall
+## 8 Virtual context window and recall
 
 A model can only reason over the tokens in its context window. Recontext does not make that window larger. It
 gives the session a second, much larger space that the model can reach on demand. This design is called a
 *virtual context window*, after virtual memory in an operating system. The term and the idea come from MemGPT
 ([Packer et al., 2023](https://arxiv.org/abs/2310.08560)).
 
-### Two windows
+### 8.1 Two windows
 
 | | Active context | Virtual context window |
 |---|---|---|
@@ -312,7 +339,7 @@ window.
   <img src="assets/recall-window-light.svg" alt="On a log scale, the active context saws between 50k and 121k over 61 shrinks, while the virtual window climbs past a 200k real window to about 4.5M tokens" width="100%">
 </picture></p>
 
-### Tiers
+### 8.2 Tiers
 
 As in a computer's memory, each level is larger and slower to reach than the one above it.
 
@@ -323,7 +350,7 @@ As in a computer's memory, each level is larger and slower to reach than the one
 | T2 session index | every path, file, id, command and name the session used, with archive refs | `recall` exact lookup | code only, no model call |
 | T3 archive | every message, one line each | `recall` search | one Haiku call under the 80k budget |
 
-### Recall
+### 8.3 Recall
 
 Recall is what happens when the model needs something that is not in its active context, much like a page fault.
 The model calls `recall` with a question. Code first looks the question up in the session index (T2). If an item
@@ -351,7 +378,7 @@ model call. Measured by replaying 91 shrinks with code only:
   <img src="assets/recall-tiers-light.svg" alt="Where a needed exact fact is found: 0.2.12 holds 50.0% in the handoff and needs an archive search for the rest; 0.3.0 holds 90.4% and finds the rest by exact lookup" width="100%">
 </picture></p>
 
-### Recall in use
+### 8.4 Recall in use
 
 Across 81 `recall` calls in live sessions (all versions), counted from the local log:
 
@@ -366,7 +393,7 @@ correct and 1 wrong. None contained an invented fact: every error was a false "n
 something the archive did hold. With 15 answers the 95% interval for the fully-correct rate is wide, about 45% to
 92%, so treat it as a direction, not a precise score. These answers predate 0.3.0's exact lookup.
 
-### What it is not
+### 8.5 What it is not
 
 - **Not a larger real window.** The model still reasons over the active context only. A fact in the archive helps
   only once `recall` brings it in, and the model has to know to ask.
@@ -377,7 +404,7 @@ something the archive did hold. With 15 answers the 95% interval for the fully-c
 
 Run `python3 assets/recall.py` to redraw the diagrams. The inputs are at the top of the file.
 
-## Files it writes
+## 9 Files it writes
 
 Everything stays on your machine, in `~/.claude/projects/<project>/handoffs/` (or `handoffDir`):
 
@@ -392,7 +419,7 @@ It writes no logs or usage data. `claude --debug` shows one trace line per shrin
 
 The only model calls are the Haiku calls, made through Claude Code's own model access like any other request.
 
-## Limits
+## 10 Limits
 
 - **Facts that appear only in tool output can be missing from the summary.** The digest drops tool output to
   stay small. Recall still finds them, but only if Claude asks.
@@ -406,7 +433,7 @@ The only model calls are the Haiku calls, made through Claude Code's own model a
 - **Exact lookup covers the main session.** A subagent's recall searches its own and the session's archives,
   but answers only through the search and Haiku.
 
-## Uninstall
+## 11 Uninstall
 
 ```sh
 claude plugin uninstall shrink@recontext
@@ -415,7 +442,7 @@ claude plugin marketplace remove recontext   # optional
 
 Built-in compaction takes over again at once. The `handoffs/` folders stay until you delete them.
 
-## Development
+## 12 Development
 
 ```sh
 git clone https://github.com/landtml/recontext
@@ -428,11 +455,11 @@ npx -p typescript tsc -p .     # type-check (needs .claude-plugin/types/, writte
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the layout and the rules the code keeps.
 
-## Credits
+## 13 Credits
 
 The retrieval and answer checks (reciprocal rank fusion, evidence expansion, the reader prompt and the citation
 gates) are adapted from [governed-rag](https://github.com/landtml/governed-rag).
 
-## License
+## 14 License
 
 [MIT](LICENSE)
