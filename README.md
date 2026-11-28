@@ -61,6 +61,7 @@ shrink ▸ context 82k / 100k ▓▓▓▓▓▓▓▓░░ · 2 shrinks (Haiku
   - [4.2 Cost model](#42-cost-model)
   - [4.3 Optimum](#43-optimum)
   - [4.4 Recommendation](#44-recommendation)
+  - [4.5 Comparison with the built-in default](#45-comparison-with-the-built-in-default)
 - [5 Usage](#5-usage)
   - [5.1 Compatibility](#51-compatibility)
   - [5.2 Installation](#52-installation)
@@ -330,6 +331,23 @@ close to 100k on a flat curve.
 To fit the value to your own work, measure F and g from your sessions and compute T* = F + √(2gC). Then set
 `autoCompactWindow` to about T* + 33000, and no lower than `100000`. Run `python3 assets/economics.py` to redraw
 the diagrams. The inputs are at the top of the file.
+
+### 4.5 Comparison with the built-in default
+
+Claude Code's default 200k window compacts at about 167k. Using the same cost model with one measured built-in
+compaction (a 3.4k summary that left an 18k context), and pricing the summary's Opus output at about 50 cache
+reads per token, the default comes to the following:
+
+| Setup | Cost per turn, in cache-read tokens |
+|---|---|
+| Built-in compaction at 167k (default) | 98k–116k |
+| Recontext at 100k (recommended) | 87k |
+
+The range for built-in comes from one unknown: whether the summary request reads the conversation from the
+cache (low end) or pays full input price (high end). The comparison rests on a single measured built-in
+compaction, so treat it as a range, not a precise figure. It also leaves three things out: details the summary
+drops and the work of finding them again, the share of a subscription usage limit that an Opus summary uses, and
+any difference in answer quality at large contexts.
 
 ## 5 Usage
 
