@@ -20,7 +20,7 @@ export type ShrinkRow = {
 export type ShrinkRecallRow = {
   at: number
   question: string
-  outcome: 'answer' | 'not-found' | 'raw' | 'unavailable' | 'failed'
+  outcome: 'answer' | 'lookup' | 'not-found' | 'raw' | 'unavailable' | 'failed'
   tries: number
 }
 

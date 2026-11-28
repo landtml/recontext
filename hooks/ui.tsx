@@ -15,11 +15,6 @@ const fill = atom({ plugin: 'shrink', key: 'fill' } as const, {}, { shape: 'fill
 const shrinks = atom({ plugin: 'shrink', key: 'shrinks' } as const, [], { shape: 'shrinks-1' })
 const recalls = atom({ plugin: 'shrink', key: 'recalls' } as const, [], { shape: 'recalls-1' })
 
-/** The last measured context size. */
-export async function fillTokens($: EngineInterface): Promise<number | undefined> {
-  return (await read($, fill)).tokens
-}
-
 /**
  * A new fill reading. A token count that arrives while the newest shrink has no "after" yet
  * becomes that shrink's "after" (the first measure past it).

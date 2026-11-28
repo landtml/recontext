@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { READER_SYSTEM, checkDraft, formatRecall, namedNote, parseDraft, readerPrompt, renderEvidence, type Draft } from './reader'
+import { CUT_FEEDBACK, READER_SYSTEM, checkDraft, formatRecall, isCut, namedNote, notDraftProblem, parseDraft, readerPrompt, relabelCitations, renderEvidence, type Draft } from './reader'
 import type { Unit } from './units'
 
 const unit = (n: number, kind: Unit['kind'], text: string): Unit => ({
@@ -205,4 +205,107 @@ test('G2: a quote matches unit text whose JSON escapes are decoded (0.2.9)', () 
     abstain: false,
   }
   expect(checkDraft(d, evidence, 'q')).toEqual([])
+})
+
+// 0.2.11 gate repairs: a comma right after a number is not part of it; clock times inside ISO timestamps.
+test('G3 (0.2.11): a comma after a number is not part of it (a)', () => {
+  const { evidence } = renderEvidence([toolUnit(4, 'Bash: count\n4,100 then 3,900 rows')])
+  const d: Draft = { answer: 'It used 4,100, then 3,900 [E1].', citations: [{ id: 'E1', quote: 'then 3,900 rows' }], abstain: false }
+  expect(checkDraft(d, evidence, 'q')).toEqual([])
+})
+
+test('G3 (0.2.11): "80, 443" is two numbers, both sourced by a quote of "80 and 443" (b)', () => {
+  const { evidence } = renderEvidence([toolUnit(4, 'Bash: ss -tln\n80 and 443 open')])
+  const d: Draft = { answer: 'Ports 80, 443 were open [E1].', citations: [{ id: 'E1', quote: '80 and 443' }], abstain: false }
+  expect(checkDraft(d, evidence, 'q')).toEqual([])
+})
+
+test('G3 (0.2.11): a number after a comma is still unsourced when no source holds it (c)', () => {
+  const { evidence } = renderEvidence([toolUnit(4, 'Bash: count\n4,100 then 3,900 rows')])
+  const d: Draft = { answer: 'It took 4,200, then stopped [E1].', citations: [{ id: 'E1', quote: '4,100' }], abstain: false }
+  expect(checkDraft(d, evidence, 'q')).toEqual(['G3:number_unsourced:4200'])
+})
+
+test('G3 (0.2.11): a clock time is found inside an ISO timestamp (a)', () => {
+  const { evidence } = renderEvidence([toolUnit(4, 'Bash: log\n{"ts":"2026-11-27T19:03:00.123Z","msg":"start"}')])
+  const q = '"ts":"2026-11-27T19:03:00.123Z"'
+  expect(checkDraft({ answer: 'It ran at 19:03 [E1].', citations: [{ id: 'E1', quote: q }], abstain: false }, evidence, 'q')).toEqual([])
+  expect(checkDraft({ answer: 'It ran at 19:03:00 [E1].', citations: [{ id: 'E1', quote: q }], abstain: false }, evidence, 'q')).toEqual([])
+})
+
+test('G3 (0.2.11): a clock time is not found inside a longer number or clock (b)', () => {
+  // the quote is "logged" so that it does not itself source 19:03
+  for (const line of ['119:03 logged', '19:031 logged', '01:19:03 logged']) {
+    const { evidence } = renderEvidence([toolUnit(4, `Bash: log\n${line}`)])
+    const d: Draft = { answer: 'It ran at 19:03 [E1].', citations: [{ id: 'E1', quote: 'logged' }], abstain: false }
+    expect(checkDraft(d, evidence, 'q')).toEqual(['G3:number_unsourced:19:03'])
+  }
+})
+
+test('G3 (0.2.11): a plain number is still not found inside an identifier (c)', () => {
+  const { evidence } = renderEvidence([toolUnit(4, 'Bash: ls\nid T4100 here')])
+  const d: Draft = { answer: 'It cost 4100 [E1].', citations: [{ id: 'E1', quote: 'id T4100 here' }], abstain: false }
+  expect(checkDraft(d, evidence, 'q')).toEqual(['G3:number_unsourced:4100'])
+})
+
+test('G3 (0.2.12): a session id or git hash that opens with a digit is an identifier, not a number', () => {
+  const { evidence } = renderEvidence([toolUnit(4, 'Bash: ls\n6b0d4e1a-52c3-4f8e-8d27-91a3f5c0e6b2.jsonl at 8c3a1f5')])
+  const d: Draft = {
+    answer: 'The transcript is session 6b0d4e1a-52c3-4f8e-8d27-91a3f5c0e6b2, built at commit 8c3a1f5 [E1].',
+    citations: [{ id: 'E1', quote: 'at 8c3a1f5' }],
+    abstain: false,
+  }
+  expect(checkDraft(d, evidence, 'q')).toEqual([])
+})
+
+test('G3 (0.2.12): sizes and units next to a hex-like id are still checked as values', () => {
+  const { evidence } = renderEvidence([toolUnit(4, 'Bash: ls\nrun 6b0d4e1a done')])
+  for (const [value, n] of [['1920x1080', '1920'], ['35ms', '35'], ['2x', '2'], ['123456', '123456']]) {
+    const d: Draft = { answer: `Run 6b0d4e1a used ${value} [E1].`, citations: [{ id: 'E1', quote: 'done' }], abstain: false }
+    expect(checkDraft(d, evidence, 'q')).toContain(`G3:number_unsourced:${n}`)
+  }
+})
+
+test('G0:cut: a reply whose JSON never closes is cut, a closed or plain one is not', () => {
+  const cut = '{"answer": "It moved [E1].", "citations": [{"id": "E1", "quote": "moved to the new {folder}"}, {"id": "E2", "quote": "tail with \\" and'
+  expect(isCut(cut)).toBe(true)
+  expect(notDraftProblem(cut)).toBe('G0:cut')
+  expect(isCut('{"answer": "ok {not a brace}", "citations": []}')).toBe(false)
+  expect(isCut('no json here')).toBe(false)
+  expect(notDraftProblem('```json\n{"answer": 1}\n``` trailing')).toBe('G0:not_json')
+  expect(CUT_FEEDBACK.startsWith('G0:cut: ')).toBe(true)
+})
+
+test('relabelCitations moves a citation one id off to the unit that holds its quote, with its marker', () => {
+  const d: Draft = { abstain: false, answer: 'There are 1,872 invoices [E1].', citations: [{ id: 'E1', quote: '1,872 invoices in batches 1-2' }] }
+  const r = relabelCitations(d, ev)
+  expect(r.citations[0]!.id).toBe('E2')
+  expect(r.answer).toBe('There are 1,872 invoices [E2].')
+  expect(checkDraft(r, ev)).toEqual([])
+})
+
+test('relabelCitations leaves a quote no unit holds for G2 to reject', () => {
+  const d: Draft = { abstain: false, answer: 'x [E1].', citations: [{ id: 'E1', quote: 'not anywhere in evidence' }] }
+  const r = relabelCitations(d, ev)
+  expect(r).toEqual(d)
+  expect(checkDraft(r, ev)).toContain('G2:quote_not_found:E1')
+})
+
+test('relabelCitations keeps the marker when another citation still uses the old id', () => {
+  const d: Draft = {
+    abstain: false,
+    answer: 'Sent yet [E1], and 1,872 invoices [E1].',
+    citations: [{ id: 'E1', quote: 'no invoice will be sent yet' }, { id: 'E1', quote: '1,872 invoices' }],
+  }
+  const r = relabelCitations(d, ev)
+  expect(r.citations.map(c => c.id)).toEqual(['E1', 'E2'])
+  expect(r.answer).toBe(d.answer)
+})
+
+test('G3 takes an ISO timestamp the cited unit holds verbatim as one value', () => {
+  const stamp = renderEvidence([unit(4, 'tool', 'logged at 2026-11-27T19:03:00.123Z ok')]).evidence
+  const ok: Draft = { abstain: false, answer: 'It logged 2026-11-27T19:03:00.123Z [E1].', citations: [{ id: 'E1', quote: 'logged at' }] }
+  expect(checkDraft(ok, stamp)).toEqual([])
+  const bad: Draft = { abstain: false, answer: 'It logged 2026-11-27T19:04:00.123Z [E1].', citations: [{ id: 'E1', quote: 'logged at' }] }
+  expect(checkDraft(bad, stamp).some(p => p.startsWith('G3:'))).toBe(true)
 })

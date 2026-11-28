@@ -209,10 +209,10 @@ Y1 = 2.1
 text('SHRINK  ·  WHEN THE CONTEXT WINDOW FILLS', -9.0, 3.58, 0.155, RED, 'Bold', align='LEFT', spacing=1.2)
 row1 = [
     ('ctx',   ic_chat,   'Conversation',   ['the full session,', 'e.g. 300k tokens'],          'BEFORE'),
-    ('code',  ic_db,     'Index + archive', ['every message and', 'tool call, split up'],      'CODE'),
+    ('code',  ic_db,     'Index + archive', ['every message split up;', 'exact items merged'],      'CODE'),
     ('code',  ic_funnel, 'Digest',          ['tool output pruned,', 'at most 80k tokens'],     'CODE'),
     ('haiku', ic_spark,  'State of work',   ['goal, decisions,', 'next step'],                 'HAIKU'),
-    ('code',  ic_list,   'Facts + tail',    ['exact quotes, files, errors;', 'recent messages kept'], 'CODE'),
+    ('code',  ic_list,   'Facts + tail',    ['items in play, errors;', 'recent messages kept'], 'CODE'),
     ('ctx',   ic_recall, 'Fresh context',   ['handoff + tail;', 'the model continues'],        'AFTER'),
 ]
 for x, (k, ic, t, s, tag) in zip(XS, row1):
@@ -226,8 +226,8 @@ bx0, bx1 = XS[1] - CW / 2, XS[4] + CW / 2
 rrect((bx0 + bx1) / 2, BY, bx1 - bx0, BH, BH / 2, 0.0, INK)
 for i, yy in enumerate((0.1, 0.0, -0.1)):
     rrect(bx0 + 0.5, BY + yy, 0.3, 0.07, 0.035, 0.02, RED_LT if i == 1 else WHITE)
-text('ARCHIVE + INDEX ON DISK', bx0 + 0.85, BY, 0.155, WHITE, 'Bold', align='LEFT', spacing=1.2)
-text('every message and full tool result, kept and searchable', bx0 + 3.55, BY, 0.18, '#D9C4BD', align='LEFT')
+text('ARCHIVE + INDEXES ON DISK', bx0 + 0.85, BY, 0.155, WHITE, 'Bold', align='LEFT', spacing=1.2)
+text('every message, full tool result and exact item, kept and searchable', bx0 + 3.55, BY, 0.18, '#D9C4BD', align='LEFT')
 arrow(XS[1], Y1 - CH / 2 - 0.05, XS[1], BY + BH / 2 + 0.04)
 
 # recall row (right to left)
@@ -235,7 +235,7 @@ Y2 = -1.85
 text('RECALL  ·  WHEN THE MODEL NEEDS AN EXACT DETAIL', -9.0, -0.38, 0.155, RED, 'Bold', align='LEFT', spacing=1.2)
 row2 = [
     (XS[5], 'ctx',   ic_question, 'Model asks',      ['recall(question,', 'leads)'],                'MODEL'),
-    (XS[4], 'code',  ic_search,   'Search',          ['BM25 + exact leads,', 'fused ranking'],      'CODE'),
+    (XS[4], 'code',  ic_search,   'Lookup + search', ['exact item: code answers;', 'else BM25 + leads'],      'CODE'),
     (XS[3], 'haiku', ic_spark,    'Reader',          ['answers from the', 'evidence only'],         'HAIKU'),
     (XS[2], 'code',  ic_check,    'Gates',           ['each quote found', 'verbatim, numbers sourced'], 'CODE'),
     (XS[1], 'ctx',   ic_quote,    'Answer',          ['with sources and', 'exact quotes'],          'TOOL RESULT'),
@@ -301,5 +301,8 @@ scene.render.resolution_x, scene.render.resolution_y = 1920, 1080
 scene.render.resolution_percentage = PCT
 scene.render.image_settings.file_format = 'PNG'
 scene.render.image_settings.color_mode = 'RGB'
+for k in ('date', 'time', 'render_time', 'frame', 'frame_range', 'memory', 'hostname', 'camera', 'lens', 'scene', 'filename', 'marker', 'sequencer_strip'):
+    setattr(scene.render, 'use_stamp_' + k, False)
+scene.render.use_stamp_note = False
 scene.render.filepath = os.path.join(OUT, 'architecture.png')
 bpy.ops.render.render(write_still=True)

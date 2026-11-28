@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { archiveEmptyLines, archiveLineCount, checkRefs, qualifyRefs } from './refs'
+import { archiveEmptyLines, archiveLineCount, checkRefs, cleanDigestTalk, qualifyForeign, qualifyRefs } from './refs'
 
 test('qualifyRefs: plain refs gain the archive number; qualified refs, headings and ids stay', () => {
   expect(qualifyRefs('Fixed G3 (#236, #84). Range #33–#39.', 4)).toBe('Fixed G3 (#4:236, #4:84). Range #4:33–#4:39.')
@@ -141,3 +141,61 @@ test('checkRefs: a dropped ref with a filler word leaves no empty bracket (0.2.1
   expect(check('Kept (real words here).')).toBe('Kept (real words here).')
 })
 
+test("qualifyForeign: plain and qualified refs name the other session's archives; code spans stay (0.2.11)", () => {
+  expect(qualifyForeign('see #40 and #2:17, `#7`, range #33–#39.', '4a9e7c13', 3)).toBe(
+    'see 4a9e7c13-3#40 and 4a9e7c13-2#17, `#7`, range 4a9e7c13-3#33–4a9e7c13-3#39.',
+  )
+})
+
+test('checkRefs: a ref into another session’s archive is neither repaired, relabelled nor dropped (0.2.11)', () => {
+  const r = checkRefs('Gate fixed (4a9e7c13-3#900, #5).', 10, 'Earlier (4a9e7c13-3#900).', new Map([[1, 50]]), 1)
+  expect(r.text).toBe('Gate fixed (4a9e7c13-3#900, #5).')
+  expect(r.dropped + r.repaired + r.relabeled).toBe(0)
+})
+
+test('cleanDigestTalk (0.2.11): "not in the digest" becomes "not recorded", with the same verb or "yet"', () => {
+  expect(cleanDigestTalk('- its result is not in the digest')).toEqual({ text: '- its result is not recorded', rewrites: 1 })
+  expect(cleanDigestTalk('- results are not yet in the digest')).toEqual({ text: '- results are not yet recorded', rewrites: 1 })
+  expect(cleanDigestTalk('- the write is not visible in the digest')).toEqual({ text: '- the write is not visible', rewrites: 1 })
+  expect(cleanDigestTalk('- was not confirmed in the digest')).toEqual({ text: '- was not confirmed', rewrites: 1 })
+  expect(cleanDigestTalk('- Not in the digest, sadly.')).toEqual({ text: '- Not recorded, sadly.', rewrites: 1 })
+  expect(cleanDigestTalk('- its result is not in the digest.')).toEqual({ text: '- its result is not recorded.', rewrites: 1 })
+})
+
+test('cleanDigestTalk (0.2.11): "the digest does not show/confirm/say/mention" becomes "the conversation does not ..."', () => {
+  expect(cleanDigestTalk('the digest does not show whether it ran.')).toEqual({ text: 'the conversation does not show whether it ran.', rewrites: 1 })
+  expect(cleanDigestTalk('The digest does not confirm the fix.')).toEqual({ text: 'The conversation does not confirm the fix.', rewrites: 1 })
+})
+
+test('cleanDigestTalk (0.2.11): each match counts one rewrite', () => {
+  const r = cleanDigestTalk('Its result is not in the digest; the digest does not say so.')
+  expect(r).toEqual({ text: 'Its result is not recorded; the conversation does not say so.', rewrites: 2 })
+})
+
+test('cleanDigestTalk (0.2.11): code spans, file names, code words, and other digest talk are left alone', () => {
+  const kept = [
+    '`not in the digest` is the phrase',
+    'Change digest.ts so results are not in the digest',
+    'the result line is not in the digest yet',
+    'that answer is cut off in the digest',
+    'the reader never sees the digest',
+    'the shrink digest cap is 320k',
+  ]
+  for (const line of kept) expect(cleanDigestTalk(line)).toEqual({ text: line, rewrites: 0 })
+  const multi = kept.join('\n')
+  expect(cleanDigestTalk(multi)).toEqual({ text: multi, rewrites: 0 })
+  expect(cleanDigestTalk('')).toEqual({ text: '', rewrites: 0 })
+})
+
+test('cleanDigestTalk (0.2.11): a guarded line stays whole, other lines are rewritten', () => {
+  const text = 'the buildDigest result is not in the digest\n- its result is not in the digest'
+  expect(cleanDigestTalk(text)).toEqual({ text: 'the buildDigest result is not in the digest\n- its result is not recorded', rewrites: 1 })
+})
+
+test('cleanDigestTalk (0.2.11): a quoted phrase is a mention, not talk, and stays', () => {
+  const t = 'Improvements: (4) "not in the digest" wording; (5) “the digest does not show” too. Its result is not in the digest.'
+  expect(cleanDigestTalk(t)).toEqual({
+    text: 'Improvements: (4) "not in the digest" wording; (5) “the digest does not show” too. Its result is not recorded.',
+    rewrites: 1,
+  })
+})

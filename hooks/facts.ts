@@ -4,7 +4,9 @@
 
 import type { SessionMessage, ToolUseSummary } from 'claude-code'
 import { lineNo } from './archive'
+import type { IndexEntry } from './index'
 import { HANDOFF_HEADER, type Where } from './prompt'
+import { squash, str, stringsOf } from './util'
 
 export type FactsOptions = Where & {
   verbatimUserMessages: number
@@ -13,10 +15,16 @@ export type FactsOptions = Where & {
   earlierResets?: readonly string[]
   /** This session's earlier archives, oldest first, as [k, path]: where `#k:n` refs point (0.2.3). */
   earlierArchives?: readonly (readonly [number, string])[]
+  /** The archive a handoff another session wrote names (a fork, or a resume under a new id): where `sid8-k#n` refs point (0.2.11). */
+  continuesArchive?: string
   /** The state of work this handoff carries: names it already holds are not listed again (0.2.9). */
   stateText?: string
   /** The home folder, shown as `~` in commands (0.2.9). */
   home?: string
+  /** The session index's items, best first (`rankEntries`, 0.3.0): when given, its slice replaces Files touched and Names in play. */
+  ranked?: readonly IndexEntry[]
+  /** The slice's budget in estimated tokens (0.3.0: 5,000). */
+  sliceTokens?: number
 }
 
 const CAPS = {
@@ -72,11 +80,19 @@ export function personText(text: string): string | undefined {
   return stripped
 }
 
+/**
+ * A message that is only a shrink or compact command (0.2.11): `/shrink now` with its focus text, or `/compact` with its
+ * args. The command is not the person's words, and the focus text reaches Haiku another way. A plain message with more
+ * lines after the command is the person's own words, so it stays.
+ */
+export function isShrinkCommand(text: string): boolean {
+  const said = personText(text)?.trim()
+  return said !== undefined && /^\/(?:shrink\s+now|compact)\b/.test(said) && !said.includes('\n')
+}
+
 // ---------------------------------------------------------------- helpers
 
-const squash = (s: string): string => s.replace(/\s+/g, ' ').trim()
 const ellipsis = (s: string, cap: number): string => (s.length <= cap ? s : `${s.slice(0, cap - 1)}…`)
-const str = (v: unknown): string | undefined => (typeof v === 'string' && v !== '' ? v : undefined)
 /** 0.2.9 steps run guarded: a throw gives what 0.2.8 had there (nothing), never a failed shrink. */
 const safe = <T>(f: () => T, fallback: T): T => {
   try {
@@ -344,18 +360,12 @@ const VERSIONED = /^[a-z]+\d+$/
 /** `\nSHEET` in code text is an escape, not the name `nSHEET`. */
 const ESCAPES = /\\[ntr]/g
 
-function stringsOf(v: unknown): string {
-  if (typeof v === 'string') return v
-  if (Array.isArray(v)) return v.map(stringsOf).join(' ')
-  if (v !== null && typeof v === 'object') return Object.values(v).map(stringsOf).join(' ')
-  return ''
-}
 
 // ---------------------------------------------------------------- sections
 
 /** `noMore`: entries dropped for the budget leave no "+N more" line (a name list has nowhere to point).
  *  `dropLast`: a ranked list, so the budget drops from its end. */
-type Section = { title: string; entries: string[]; dropped: number; join: string; noMore?: boolean; dropLast?: boolean }
+type Section = { title: string; entries: string[]; dropped: number; join: string; noMore?: boolean; dropLast?: boolean; more?: (n: number) => string }
 
 function capOldest(entries: string[], cap: number): { entries: string[]; dropped: number } {
   const dropped = Math.max(0, entries.length - cap)
@@ -370,7 +380,7 @@ function moreLine(n: number, where: Where): string {
 
 function renderSection(s: Section, where: Where): string {
   const lines = [`## ${s.title}`]
-  if (s.dropped > 0 && !s.noMore) lines.push(moreLine(s.dropped, where))
+  if (s.dropped > 0 && !s.noMore) lines.push(s.more ? s.more(s.dropped) : moreLine(s.dropped, where))
   return `${lines.join('\n')}\n${s.entries.join(s.join)}`.trimEnd()
 }
 
@@ -388,6 +398,51 @@ function earlierResetsLine(paths: readonly string[], title = '- Earlier resets o
 }
 
 // ---------------------------------------------------------------- buildFacts
+
+export const SLICE_TOKENS = 5000
+export const SLICE_TITLE = 'Items in play (exact names from the session index, best ranked first)'
+/** Characters per slice line: short lines let the facts budget drop the slice from its end. */
+const SLICE_LINE = 400
+
+/** True when the text already holds the item: as written, or a path by its last two segments. */
+export function heldIn(item: string, textLc: string): boolean {
+  const i = item.toLowerCase()
+  if (textLc.includes(i)) return true
+  if (!i.includes('/')) return false
+  const tail = i.replace(/\/+$/, '').split('/').slice(-2).join('/')
+  return tail.length >= 6 && textLc.includes(tail)
+}
+
+/**
+ * The index slice (0.3.0): ranked index items, each written in full as `` `item` ``, packed into `budgetTokens` est.
+ * tokens (2 chars each). Paths stay whole: grouping by folder with per-item refs kept fewer
+ * items useful in testing; refs come from recall. An item that does not fit is passed over, so a smaller one
+ * later can still fit; `more` counts every item left out that `skip` did not remove.
+ */
+export function indexSlice(ranked: readonly IndexEntry[], budgetTokens: number, skip: (item: string) => boolean): { lines: string[]; packed: number; more: number } {
+  const budget = 2 * budgetTokens
+  const lines: string[] = []
+  let line = ''
+  let used = 0
+  let packed = 0
+  let more = 0
+  for (const e of ranked) {
+    if (skip(e.item)) continue
+    const piece = `\`${e.item}\``
+    const fresh = !line || line.length + piece.length + 1 > SLICE_LINE
+    const cost = piece.length + (fresh ? 3 : 1) // "- " and "\n" open a line, " " joins
+    if (used + cost > budget) {
+      more++
+      continue
+    }
+    if (fresh && line) lines.push(line)
+    line = fresh ? `- ${piece}` : `${line} ${piece}`
+    used += cost
+    packed++
+  }
+  if (line) lines.push(line)
+  return { lines, packed, more }
+}
 
 export function buildFacts(messages: readonly SessionMessage[], opts: FactsOptions): string {
   const where: Where = { archivePath: opts.archivePath, transcriptPath: opts.transcriptPath }
@@ -442,7 +497,7 @@ export function buildFacts(messages: readonly SessionMessage[], opts: FactsOptio
       }, undefined)
     if (m.role === 'user') {
       const text = personText(m.text)
-      if (text !== undefined) said.push({ n, text })
+      if (text !== undefined && !isShrinkCommand(m.text)) said.push({ n, text })
       for (const r of m.toolResults ?? []) if (!r.isError) answered(n, asks.get(r.tool_use_id), r.text)
     }
     for (const u of m.toolUses ?? []) {
@@ -529,6 +584,9 @@ export function buildFacts(messages: readonly SessionMessage[], opts: FactsOptio
         `- Earlier archives (\`#k:n\` is line n of shrink k's archive: ${opts.earlierArchives.map(([k]) => k).join(', ')})`,
       ),
     )
+  const continues = opts.continuesArchive && /_([A-Za-z0-9]+)-\d+\.txt$/.exec(opts.continuesArchive)?.[1]
+  if (opts.continuesArchive && continues)
+    whereLines.push(`- Archive of the session this one continues (its refs read \`${continues}-k#n\`): ${opts.continuesArchive}`)
   if (whereLines.length === 0) whereLines.push('- No archive or transcript was kept for this session.')
   const whereS: Section = { title: 'Where to look', entries: whereLines, dropped: 0, join: '\n' }
 
@@ -553,11 +611,24 @@ export function buildFacts(messages: readonly SessionMessage[], opts: FactsOptio
   }
   commandS.dropLast = true
 
-  const sections = [verbatim, earlier, filesS, failS, commandS, namesS, urlS, agentS, whereS]
-  const budget = Math.max(0, Math.floor(opts.factsBudgetChars))
+  // 0.3.0: with the session index, its ranked slice stands in for Files touched and Names in play
+  let sliceS: Section | undefined
+  if (opts.ranked) {
+    const stateLc = (opts.stateText ?? '').toLowerCase()
+    const slice = safe(() => indexSlice(opts.ranked!, opts.sliceTokens ?? SLICE_TOKENS, it => heldIn(it, stateLc)), { lines: [], packed: 0, more: 0 })
+    sliceS = {
+      title: SLICE_TITLE, entries: slice.lines, dropped: slice.more, join: '\n', dropLast: true,
+      more: n => `+${n} more items indexed: ask recall with the exact name`,
+    }
+  }
+  const sections = sliceS
+    ? [verbatim, earlier, failS, commandS, sliceS, urlS, agentS, whereS]
+    : [verbatim, earlier, filesS, failS, commandS, namesS, urlS, agentS, whereS]
+  // the slice brings its own room (2 chars per est. token): the rest of the facts keep the budget they had
+  const budget = Math.max(0, Math.floor(opts.factsBudgetChars)) + (sliceS ? 2 * (opts.sliceTokens ?? SLICE_TOKENS) : 0)
 
   // Over budget: drop entries, least precious section first; oldest first, or least used for ranked lists.
-  const shrinkOrder = [namesS, earlier, urlS, agentS, commandS, filesS, failS, verbatim]
+  const shrinkOrder = sliceS ? [earlier, urlS, agentS, sliceS, commandS, failS, verbatim] : [namesS, earlier, urlS, agentS, commandS, filesS, failS, verbatim]
   let text = render(sections, where)
   for (const s of shrinkOrder) {
     while (text.length > budget && s.entries.length > 0) {

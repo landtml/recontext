@@ -71,6 +71,16 @@ test('the bar steps aside for a survey and when collapsed', async ($, on) => {
   }
 })
 
+test("a subagent's shrink leaves the bar as it was (0.2.11)", async ($, on) => {
+  engine(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await measure($, 112_000)
+  await $.session.compact({ trigger: 'auto', agentId: 'a0ef7f85566e49b8c', messages: INPUT })
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /shrink ▸/ }))?.text).toBe('shrink ▸ context 112k / 180k ▓▓▓▓▓▓░░░░ · no shrinks yet')
+  await ui.unmount()
+})
+
 test('after a shrink and a recall, the bar counts them and the panel lists them', async ($, on) => {
   engine(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })

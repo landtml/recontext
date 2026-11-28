@@ -1,7 +1,7 @@
 {
   "name": "shrink",
-  "version": "0.2.10",
-  "description": "Token-efficient, low-loss context compaction for Claude Code: a script prunes the transcript, Haiku distills it instead of the session model, and a recall tool answers exact questions about the compacted conversation from a local archive.",
+  "version": "0.3.0",
+  "description": "Token-efficient context shrink: Haiku writes the handoff from a code-pruned digest instead of the session model, and a recall tool answers exact questions about shrunk-away conversation from a code-built index.",
   "icon": "./assets/logo.png",
   "author": {
     "name": "landtml"

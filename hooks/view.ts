@@ -1,6 +1,7 @@
 // The text the bar and the /shrink panel show (design 7). Pure.
 
 import type { ShrinkFill, ShrinkRecallRow, ShrinkRow } from '../types'
+import { pad } from './util'
 
 const BAR_WIDTH = 10
 const QUESTION_CHARS = 60
@@ -38,13 +39,12 @@ export function bandText(fill: ShrinkFill, shrinks: readonly ShrinkRow[], recall
     parts.push(`${plural(shrinks.length, 'shrink')} (${how})`)
   }
   if (recalls.length > 0) {
-    const answered = recalls.filter(r => r.outcome === 'answer').length
+    const answered = recalls.filter(r => r.outcome === 'answer' || r.outcome === 'lookup').length
     parts.push(`${plural(recalls.length, 'recall')} (${answered} answered)`)
   }
   return parts.join(' · ')
 }
 
-const pad = (n: number): string => String(n).padStart(2, '0')
 
 /** Local clock time, hh:mm. */
 export function hhmm(ms: number): string {
@@ -61,6 +61,7 @@ export function shrinkLine(r: ShrinkRow): string {
 
 const OUTCOME: Record<ShrinkRecallRow['outcome'], string> = {
   answer: 'answered',
+  lookup: 'exact lookup',
   'not-found': 'not found',
   raw: 'unverified passages',
   unavailable: 'unavailable',

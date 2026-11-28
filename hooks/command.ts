@@ -1,6 +1,6 @@
 // The /shrink command's arguments and help text, and the mod version (design 5). Pure.
 
-export const MOD_VERSION = '0.2.10'
+export const MOD_VERSION = '0.3.0'
 
 export type ShrinkCommand = { kind: 'panel' } | { kind: 'now'; focus?: string } | { kind: 'help' } | { kind: 'unknown'; word: string }
 

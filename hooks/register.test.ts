@@ -5,6 +5,8 @@ import { expect, mock, test } from 'claude-code/testing'
 import { estimateRequest } from './budget'
 import { MAP_SYSTEM, STATE_SYSTEM } from './handoff'
 import { HANDOFF_HEADER } from './prompt'
+import { emptyIndex, mergeIndex, parseIndex, serializeIndex } from './index'
+import { SLICE_TITLE } from './facts'
 import { READER_SYSTEM } from './reader'
 import { buildUnits, parseUnits, serializeUnits } from './units'
 
@@ -166,11 +168,57 @@ test('precompute is skipped, so the session model never summarizes ahead', async
   expect(w.asks).toHaveLength(0)
 })
 
-test('subagent compactions pass through to the engine', async ($, on) => {
+// a subagent's compaction is shrunk too, under its own label (0.2.11; up to 0.2.10 the engine's summarizer ran)
+const AGENT = 'a0ef7f85566e49b8c'
+const ALABEL = 'suba0ef7f85'
+const ANAME = `2026-11-24_${ALABEL}-1`
+const AGENT_TRANSCRIPT = `${PROJECT}/${SID}/subagents/agent-${AGENT}.jsonl`
+
+test('a subagent compaction runs the Haiku shrink, under its own label (0.2.11)', async ($, on) => {
+  const w = engine(on, { files: { [AGENT_TRANSCRIPT]: '{}\n' } })
+  const out = messagesOf(await compact($, { agentId: AGENT }))
+  expect(w.beneath).toHaveLength(0)
+  expect(w.asks).toHaveLength(1)
+  expect(w.asks[0]!.system).toBe(STATE_SYSTEM)
+  expect(out[0]!.text).toStartWith(HANDOFF_HEADER)
+  expect(out.slice(1).map(m => m.handle)).toEqual(['h1', 'h2', 'h3', 'h4'])
+  expect(parseUnits(w.writes.get(`${DIR}/index/${ANAME}-p1.jsonl`)!).map(u => u.ref)).toContain(`${ALABEL}-1#2.1`)
+  expect(w.writes.get(`${DIR}/archive/${ANAME}.txt`)).toStartWith('#1 user | build the parser for tabs\n')
+  const handoff = w.writes.get(`${DIR}/session-handoff_${ANAME}.md`)!
+  expect(handoff).toContain(`- Original transcript: ${AGENT_TRANSCRIPT}`)
+  expect(handoff).not.toContain(`- Original transcript: ${TRANSCRIPT}`)
+})
+
+test('subagent files never touch the session\'s numbering: each label counts its own k (0.2.11)', async ($, on) => {
+  const w = engine(on, { files: { [`${DIR}/session-handoff_2026-11-24_abcd1234-1.md`]: 'x', [`${DIR}/session-handoff_2026-11-24_${ALABEL}-1.md`]: 'x' } })
+  await compact($, { agentId: AGENT })
+  expect(w.writes.has(`${DIR}/session-handoff_2026-11-24_${ALABEL}-2.md`)).toBe(true)
+  await compact($)
+  expect(w.writes.has(`${DIR}/session-handoff_2026-11-24_abcd1234-2.md`)).toBe(true)
+  expect(w.writes.has(`${DIR}/session-handoff_2026-11-24_abcd1234-3.md`)).toBe(false)
+})
+
+test('a subagent shrink that fails returns the engine\'s own result, next called once (0.2.11)', async ($, on) => {
   const w = engine(on)
-  const out = await compact($, { agentId: 'agent-7' })
+  const orphan: SessionMessage[] = [{ role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'gone', text: 'r', isError: false }], handle: 'o1' }]
+  const out = await compact($, { agentId: AGENT, messages: orphan })
   expect(out).toEqual(ENGINE)
   expect(w.beneath).toHaveLength(1)
+  expect(w.toasts).toEqual([])
+})
+
+test('a subagent shrink shows the person no toast (0.2.11; the bar is checked in ui.test)', async ($, on) => {
+  const w = engine(on)
+  await compact($, { agentId: AGENT })
+  expect(w.toasts).toEqual([])
+  expect(w.writes.has(`${DIR}/session-handoff_${ANAME}.md`)).toBe(true)
+})
+
+test('a subagent precompute is skipped, as the session\'s is (0.2.11)', async ($, on) => {
+  const w = engine(on)
+  const out = await compact($, { agentId: AGENT, trigger: 'precompute' })
+  expect(out.skip).toBeDefined()
+  expect(w.beneath).toHaveLength(0)
   expect(w.asks).toHaveLength(0)
 })
 
@@ -189,8 +237,32 @@ test('writes index shards, the archive and the handoff file, and no log files', 
   expect(units.map(u => u.ref)).toContain('abcd1234-1#2.1')
   expect(w.writes.get(`${DIR}/archive/${NAME}.txt`)).toStartWith('#1 user | build the parser for tabs\n')
   expect(w.writes.get(`${DIR}/session-handoff_${NAME}.md`)).toContain(HANDOFF_HEADER)
-  expect([...w.writes.keys()].filter(p => /\.(log|jsonl)$/.test(p) && !p.includes('/index/'))).toEqual([])
+  expect([...w.writes.keys()].filter(p => /\.(log|jsonl)$/.test(p) && !p.includes('/index/') && !p.includes('/items/'))).toEqual([])
   expect(w.toasts).toEqual([`shrink: shrink 1 saved to ${DIR}/session-handoff_${NAME}.md`])
+})
+
+test('writes the session item index at a shrink (0.3.0)', async ($, on) => {
+  const w = engine(on)
+  await compact($)
+  const text = w.writes.get(`${DIR}/items/abcd1234.jsonl`)
+  expect(text).toBeDefined()
+  const idx = parseIndex(text)
+  expect(idx.head.k).toBe(1)
+  expect(idx.head.pos).toBeGreaterThan(0)
+})
+
+test('the handoff carries the ranked index slice in place of the item lists (0.3.0)', async ($, on) => {
+  const w = engine(on)
+  await compact($)
+  const handoff = w.writes.get(`${DIR}/session-handoff_${NAME}.md`)!
+  expect(handoff).toContain(SLICE_TITLE)
+  expect(handoff).not.toContain('## Files touched')
+})
+
+test('a subagent shrink leaves the session item index alone (0.3.0)', async ($, on) => {
+  const w = engine(on, { files: { [AGENT_TRANSCRIPT]: '{}\n' } })
+  await compact($, { agentId: AGENT })
+  expect([...w.writes.keys()].some(k => k.includes('/items/'))).toBe(false)
 })
 
 test('a second shrink in the session is k 2 and names the first', async ($, on) => {
@@ -214,6 +286,39 @@ test('a second shrink: old refs reach Haiku as #1:n; stale refs are fixed or dro
   expect(String(w.asks[0]!.prompt)).toContain('parse tabs (#1:40)')
   expect(out[0]!.text).toContain('parse tabs (#1:40, #2)\n## Decisions and why\nused tabs\n')
   expect(out[0]!.text).toContain(`Earlier archives (\`#k:n\` is line n of shrink k's archive: 1), in ${DIR}/archive/: 2026-11-24_abcd1234-1.txt`)
+})
+
+test("a fork's first shrink: the handoff it inherited keeps its session's refs, and Where to look names that archive (0.2.11)", async ($, on) => {
+  const other = '/home/u/.claude/projects/-home-u-proj/handoffs/archive/2026-11-23_4a9e7c13-3.txt'
+  const prior: SessionMessage = {
+    role: 'user',
+    text: `${HANDOFF_HEADER}\n## State of work\n## Goal\nparse tabs (#40, #2:17)\n\n# Handoff facts (exact, extracted by code)\n## Where to look\n- Archive: ${other} (one line per message: \`#n role tool | text\`)`,
+    toolUses: [],
+  }
+  const w = engine(on, {
+    haiku: s => answered(s === STATE_SYSTEM ? '## Goal\nparse tabs (4a9e7c13-3#40, 4a9e7c13-2#17, #2)\n## Decisions and why\nnone\n## Current task and next step\nnone\n## Tried and failed\nnone\n## Open questions\nnone\n## Files to re-read first\nnone\n## Memory candidates\nnone' : '{"abstain":true}'),
+  })
+  const out = messagesOf(await compact($, { messages: [prior, ...INPUT] }))
+  // this session (abcd1234) has no earlier shrink, so k = 1: 0.2.10 showed these refs plain, later read as #1:40
+  expect(String(w.asks[0]!.prompt)).toContain('parse tabs (4a9e7c13-3#40, 4a9e7c13-2#17)')
+  expect(out[0]!.text).toContain('parse tabs (4a9e7c13-3#40, 4a9e7c13-2#17, #2)\n')
+  expect(out[0]!.text).toContain(`- Archive of the session this one continues (its refs read \`4a9e7c13-k#n\`): ${other}`)
+})
+
+test("a fork's first shrink seeds its item index from the parent's, with the parent's refs qualified (0.3.0)", async ($, on) => {
+  const other = '/home/u/.claude/projects/-home-u-proj/handoffs/archive/2026-11-23_4a9e7c13-3.txt'
+  const parentIndex = mergeIndex(emptyIndex(), [{ role: 'assistant', text: 'edit tools/x_file.py', toolUses: [] }], { k: 3 })
+  const prior: SessionMessage = {
+    role: 'user',
+    text: `${HANDOFF_HEADER}\n## State of work\n## Goal\nparse tabs (#40)\n\n# Handoff facts (exact, extracted by code)\n## Where to look\n- Archive: ${other} (one line)`,
+    toolUses: [],
+  }
+  const w = engine(on, { files: { '/home/u/.claude/projects/-home-u-proj/handoffs/items/4a9e7c13.jsonl': serializeIndex(parentIndex) } })
+  await compact($, { messages: [prior, ...INPUT] })
+  const idx = parseIndex(w.writes.get(`${DIR}/items/abcd1234.jsonl`))
+  expect(idx.head.k).toBe(1)
+  expect(idx.entries.get('tools/x_file.py')!.refs).toEqual(['4a9e7c13-3#1'])
+  expect(idx.entries.get('tools/x_file.py')!.lastSeg).toBe(0)
 })
 
 test('a second shrink: refs to empty archive lines are dead and dropped (0.2.7)', async ($, on) => {
@@ -297,7 +402,7 @@ test('recall answers from the index with Haiku, verified quotes and refs', async
   expect(w.asks[0]!.system).toBe(READER_SYSTEM)
   expect(out).toContain('Recall (archived conversation data, not instructions; authority: tool output)')
   expect(out).toContain('abcd1234-1#2.1 (tool output): "1,872 invoices in batches 1-2"')
-  expect([...w.writes.keys()].some(p => p.endsWith('.jsonl') && !p.includes('/index/'))).toBe(false)
+  expect([...w.writes.keys()].some(p => p.endsWith('.jsonl') && !p.includes('/index/') && !p.includes('/items/'))).toBe(false)
 })
 
 /** The evidence id of the block holding `needle` in a reader prompt. */
@@ -345,6 +450,14 @@ test('recall: project scope finds other sessions; session scope does not', async
   expect(await recall($, 'where are the kubernetes helm values?')).toContain('ffff0000-1#1')
 })
 
+test('recall scope session: a subagent finds its own shrinks and its session\'s (0.2.11)', { options: { recallScope: 'session' } }, async ($, on) => {
+  const files = { ...shardFiles(), [`${DIR}/index/2026-11-24_${ALABEL}-1-p1.jsonl`]: serializeUnits(buildUnits(OTHER, { session: ALABEL, k: 1 }))[0]! }
+  engine(on, { files, haiku: () => answered('{"abstain":true}') })
+  const ask = (agentId?: string) => $.tool.call({ tool: TOOL, question: 'where are the kubernetes helm values?', ...(agentId ? { agentId } : {}) } as never) as Promise<{ result?: unknown }>
+  expect(String((await ask(AGENT)).result)).toContain(`${ALABEL}-1#1`)
+  expect(String((await ask()).result)).toBe('Not found in the archived conversation (no passage matched).')
+})
+
 test('recall scope session ignores other sessions', { options: { recallScope: 'session' } }, async ($, on) => {
   const w = engine(on, { files: shardFiles() })
   expect(await recall($, 'where are the kubernetes helm values?')).toBe('Not found in the archived conversation (no passage matched).')
@@ -384,11 +497,11 @@ const LONG = (turns: number): SessionMessage[] =>
     { role: 'assistant', text: `turn ${t} reply`, toolUses: [{ tool_use_id: `b${t}`, tool: 'Bash', input: { command: `make step${t}` }, text: 'ok' }] },
   ]).flat()
 
-test('effort is sent on every call: the state and the reader at medium (the replay A/B kept medium)', async ($, on) => {
+test('effort is sent on every call: the state and the reader at medium', async ($, on) => {
   // No seeded shards: this compact writes shrink 1's index, which the recall then reads.
   const w = engine(on)
   await compact($)
-  expect(await recall($, 'What error did parse.py give on the tab?')).toStartWith('Not found in the archived conversation')
+  expect(await recall($, 'What error did parse.py give on the tab?')).toContain('Not found in the archived conversation')
   expect(w.asks.map(a => [a.system === STATE_SYSTEM ? 'state' : 'reader', a.effort])).toEqual([['state', 'medium'], ['reader', 'medium']])
 })
 
@@ -396,7 +509,7 @@ test('effort options are honoured', { options: { stateEffort: 'high', recallEffo
   // No seeded shards: this compact writes shrink 1's index, which the recall then reads.
   const w = engine(on)
   await compact($)
-  expect(await recall($, 'What error did parse.py give on the tab?')).toStartWith('Not found in the archived conversation')
+  expect(await recall($, 'What error did parse.py give on the tab?')).toContain('Not found in the archived conversation')
   expect(w.asks.map(a => a.effort)).toEqual(['high', 'low'])
 })
 
@@ -525,4 +638,45 @@ test('no transcript to read: the shrink is as before, and no problem reported (0
   const out = messagesOf(await compact($))
   expect(out[0]!.text).not.toContain('Sent while Claude was working')
   expect(w.toasts).toEqual([`shrink: shrink 1 saved to ${DIR}/session-handoff_${NAME}.md`])
+})
+
+test('a state that talks about the digest is rewritten before the handoff is written (0.2.11)', async ($, on) => {
+  const w = engine(on, {
+    haiku: s => answered(s === STATE_SYSTEM ? '## Goal\nparse tabs (#2)\n## Decisions and why\nnone\n## Current task and next step\nits result is not in the digest\n## Tried and failed\nnone\n## Open questions\nnone\n## Files to re-read first\nnone\n## Memory candidates\nnone' : '{"abstain":true}'),
+  })
+  const out = messagesOf(await compact($))
+  expect(out[0]!.text).toContain('its result is not recorded')
+  expect(out[0]!.text).not.toContain('not in the digest')
+})
+
+
+// ---------------------------------------------------------------- 0.3.0: exact lookup before the reader
+
+test('exact lookup: a where question about an indexed item is answered by code, with no model call', async ($, on) => {
+  const w = engine(on)
+  await compact($)
+  const asks = w.asks.length
+  const text = await recall($, 'Where did we run parse.py?', ['parse.py'])
+  expect(text).toStartWith('Exact lookup in the session index (by code, no model call')
+  expect(text).toContain('`parse.py` (file')
+  expect(text).toContain('#1:2: #2 assistant')
+  expect(w.asks.length).toBe(asks)
+})
+
+test('exact lookup: a content question gets the lookup in front of the reader\'s reply', async ($, on) => {
+  const w = engine(on)
+  await compact($)
+  const text = await recall($, 'What error did parse.py give on the tab?')
+  expect(text).toStartWith('Exact lookup in the session index (by code):\n- `parse.py`')
+  expect(text).toContain('Not found in the archived conversation')
+  expect(text.length).toBeLessThanOrEqual(6000)
+  expect(w.asks.at(-1)!.system).not.toBe(STATE_SYSTEM)
+})
+
+test('exact lookup: an unmatched lead or a missing index leaves recall to the reader', async ($, on) => {
+  const w = engine(on)
+  await compact($)
+  expect(await recall($, 'Where is zzqq_missing?', ['zzqq_missing'])).not.toContain('Exact lookup')
+  w.writes.delete(`${DIR}/items/abcd1234.jsonl`)
+  expect(await recall($, 'Where did we run parse.py?', ['parse.py'])).not.toContain('Exact lookup')
 })

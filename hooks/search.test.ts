@@ -243,3 +243,14 @@ test('expand: hits past the core come after the neighbours, and only if they fit
   // no core given: every hit first, as before
   expect(expand(units, hits, 300, Infinity).map(u => u.n)).toEqual([2, 9])
 })
+
+test("a unit ref into another session's archive pins that unit (0.2.11: refs a forked session inherits)", () => {
+  const units = [
+    unit(1, 'the parser handles tabs'),
+    unit(40, 'decided: the gate keeps commas out of numbers', { session: '4a9e7c13', k: 3, ref: '4a9e7c13-3#40' }),
+    unit(2, 'the parser handles spaces'),
+  ]
+  const hits = search(units, { question: 'What was decided at 4a9e7c13-3#40 about the parser?' }, { currentSession: 's1' })
+  expect(hits[0]!.unit.ref).toBe('4a9e7c13-3#40')
+  expect(hits[0]!.named).toEqual(['4a9e7c13-3#40'])
+})

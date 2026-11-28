@@ -8,6 +8,7 @@ import type { SessionMessage, ToolUseSummary } from 'claude-code'
 import { formatInput, lineNo } from './archive'
 import { personText } from './facts'
 import { HANDOFF_HEADER } from './prompt'
+import { ENGINE_SUMMARY, str } from './util'
 
 export type SourceKind = 'user' | 'tool' | 'assistant' | 'handoff'
 
@@ -36,7 +37,6 @@ const MAX_ENTITIES = 50
 const SHARD_BYTES = 3 * 1024 * 1024
 
 /** The engine's own summary row of an earlier built-in compaction. */
-const ENGINE_SUMMARY = 'This session is being continued from a previous conversation'
 
 const URL_RE = /https?:\/\/[^\s'"`<>()[\]{}|\\^]+/g
 const PATH_RE = /(?:~|\.{1,2})?\/[\w.@-]+(?:\/[\w.@-]+)*|\b[\w.-]+\/[\w.@/-]*[\w@-]/g
@@ -57,7 +57,6 @@ export function entitiesOf(text: string): string[] {
   return [...seen]
 }
 
-const str = (v: unknown): string | undefined => (typeof v === 'string' && v !== '' ? v : undefined)
 
 /** Paths and URLs the call names in its input, ahead of what its text mentions. */
 function inputEntities(u: ToolUseSummary): string[] {

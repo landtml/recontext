@@ -3,8 +3,47 @@
 The project was renamed from claude-shrink-compaction to Recontext with 0.2.8. The plugin is still called
 `shrink`, so `/shrink`, `/shrink now` and the `recall` tool keep their names.
 
-Versions 0.2.0 to 0.2.10 also had local logging used during development. It is not part of the public
+Versions 0.2.0 to 0.3.0 also had local logging used during development. It is not part of the public
 release and is left out of these notes.
+
+## 0.3.0
+
+- **Session index.** Every exact item the session has used (paths, files, ids, versions, code names, MCP tool
+  names), each command that ran and each of your prompts go into an append-only index next to the archive,
+  `items/<session>.jsonl`, with counts, read / write / edit marks and up to 8 `#k:n` refs. Code merges it at
+  each shrink from the previous index and the new window only, so the cost of a shrink does not grow with the
+  session.
+- **Items in play.** The handoff shows a ranked slice of that index (up to about 5,000 tokens), grouped by folder,
+  in place of "Files touched" and "Names in play". It is not limited to the last window: a file from three shrinks
+  ago can still be listed. A last line gives the number of items not shown, which recall can find by exact name.
+  Items the state of work already names are left out.
+- **Exact lookup in recall.** A question or lead that names an indexed item is answered by code from the index
+  and its archive lines, with no model call. When those lines do not answer the question by themselves, they
+  come first and Haiku answers below them as before.
+- Recall: a quote is checked against the full message, not the shortened archive line, so a correct quote
+  from a long tool result is no longer rejected. An ISO timestamp counts as one value in the number check.
+- Measured on a replay of 91 past shrinks: the handoff held 90% of the exact names that later work needed,
+  against 50% for 0.2.12, at about 4,400 more tokens per handoff. No exact item was lost from one shrink to the
+  next.
+
+## 0.2.12
+
+- Recall: an id made of hex digits that starts with a digit (a commit hash, a session id) is no longer read as
+  a number by the number check.
+
+## 0.2.11
+
+- **Subagents are shrunk too.** A subagent's compaction runs the same Haiku shrink as the session, not the
+  built-in summarizer on the session model. Its files carry their own label (`sub` and the first 8 letters and
+  digits of the agent id), so its refs never point into the session's archives. It adds no toast and no panel
+  row. Any error still hands the compaction to Claude Code.
+- **Forks.** A handoff written by another session keeps that session's refs (`3f1c8a20-3#40`), and "Where to
+  look" names the archive the fork continues. Before, a fork's first shrink read them as its own.
+- A message that is only `/shrink now` or `/compact` is not read as the task and gets no digest line.
+- The state of work says "not recorded" where it said "not in the digest", since the next reader never sees the
+  digest.
+- Recall number check: a number followed by a comma matches the same number in the source, and a clock time
+  matches inside an ISO timestamp.
 
 ## 0.2.10
 

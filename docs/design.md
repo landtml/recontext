@@ -21,8 +21,7 @@ Goals, in order:
    compaction.
 4. **Lean context:** the new conversation (handoff plus kept tail) stays small.
 
-Not in scope: embeddings or a vector store (the plugin runtime has none), shrinking subagents (they keep the
-built-in compaction), and search across projects.
+Not in scope: embeddings or a vector store (the plugin runtime has none) and search across projects.
 
 ## 2. Overview
 
@@ -31,13 +30,14 @@ session.compact (main conversation; trigger auto | manual)
   1. CODE   units + archive + index shards        archive/<name>.txt, index/<name>-p<j>.jsonl
   2. CODE   digest of the conversation            (3.1)
   3. HAIKU  state of work: one call, or map + merge when over budget   (3.2, 3.3, 3.4)
-  4. CODE   exact facts, kept tail, ref checks    (3.5, 3.6)
+  4. CODE   session index merged, exact facts with its ranked slice, kept tail, ref checks   (3.5, 3.6, 3.8)
   5. return [handoff message, ...tail]            the engine's summarizer never runs
   6. write session-handoff_<name>.md
 session.compact, trigger precompute  -> skip   (it would run the session model's summarizer)
-session.compact from a subagent      -> pass through to the engine
+session.compact from a subagent      -> the same shrink, under the subagent's own label   (3.9)
 
 recall({ question, leads? })          mcp__shrink__recall, served at tool.call
+  0. CODE   exact lookup in the session index; answers alone when its lines suffice   (4.5)
   1. CODE   load index shards (this session first, then the project's others)   (4.1)
   2. CODE   search: BM25 + exact leads + quoted phrases, fused by RRF            (4.2)
   3. CODE   evidence: hits plus neighbours, within the budget                    (4.3)
@@ -78,8 +78,8 @@ goal and the current task. If neither does, the handoff is code-only.
 
 ### 3.5 Handoff and kept tail (`handoff.ts`, `facts.ts`)
 The handoff is one user message that starts with a header the mod recognizes later as machine text. It holds
-the state of work, exact facts extracted by code (your recent messages verbatim, files touched, and so on, up
-to `factsBudgetChars`; also commands that worked more than once and names in play), where to look (the
+the state of work, exact facts extracted by code (your recent messages verbatim, failed commands, and so on, up
+to `factsBudgetChars`; also commands that worked more than once), the items in play (3.8), where to look (the
 archives), and a standing instruction: apply the memory candidates, re-read the files, continue, and call
 `recall` before guessing.
 
@@ -103,6 +103,29 @@ request would lose it. The shrink reads the end of the transcript for queued row
 followed and that are not among the handed messages. It puts their text word for word at the top of the
 handoff, notes attached images, and adds them to the archive, index, digest and facts as user messages.
 A failed read changes nothing else.
+
+### 3.8 Session index and items in play (`index.ts`)
+Summaries drop exact names: a path, an id or a version that only the summary held is gone after the next shrink.
+So every exact item the session uses (paths, file names, hex ids, versions, snake_case and camelCase names, MCP
+tool names), each Bash command that ran and each of your prompts go into `items/<session>.jsonl`, an append-only
+index kept by code. An entry holds how often the model typed the item and was shown it, its read / write / edit
+marks, the shrink and position of its last use and up to 8 `#k:n` refs. Each shrink merges the previous index
+with the new window only, skipping messages it has already seen, so its cost stays O(window). A fork's first
+shrink seeds its index from the session it continues.
+
+The handoff shows a slice of it, "Items in play", in place of the "Files touched" and "Names in play" sections
+of 0.2.x. Entries are ranked by a fixed logistic score over their counts, kind, marks and recency (weights in
+`RANK_WEIGHTS`, fitted offline on held-out sessions), grouped by folder and packed up to 5,000 estimated tokens,
+which has its own room beside `factsBudgetChars`. Items the state of work already names are left out, and the last
+line says how many more are indexed. On a replay of 91 past shrinks the handoff held 90% of the exact names that
+later work needed, against 50% before, at about 4,400 more tokens per handoff.
+
+### 3.9 Subagents
+A subagent's compaction runs the same shrink. Its files carry the label `sub` plus the first 8 letters and digits of
+the agent id; session labels are hex, so they never collide and the session's shrink count is unchanged. Its handoff
+names its own transcript (`<session>/subagents/agent-<id>.jsonl`) when that file exists. It reads no queued
+messages (those are the session's), merges no session index, and adds no toast and no panel row. Any error hands the
+compaction to the engine, as for the session.
 
 ## 4. Recall
 
@@ -141,6 +164,14 @@ the evidence and cite each claim with a verbatim quote, or abstain. Code then ch
 A failed draft gets one retry that names the failures. If that fails too, or Haiku errors, recall returns the
 top raw passages marked unverified. "Not found" comes with the 3 closest leads. A reply is at most 6k characters.
 
+### 4.5 Exact lookup (`lookup.ts`)
+Before the search, recall takes the terms of the question and leads that look like items and matches them in
+the session index: the exact item, then a file name, a shorter path the term ends with, a file stem, then a
+substring (4+ characters). Up to 6 entries are shown with their counts, marks and the archive lines of up to
+3 refs. When those lines answer the question (it names an item and asks for no why or how), that is the reply,
+with no model call. Otherwise they come first and the usual search and reader answer below them. A lookup that
+fails changes nothing: recall goes on as before. Subagents skip it, since their window is not in the index.
+
 ## 5. Hooks and commands (`register.ts`, `command.ts`)
 - `session.start` registers the recall tool and `/shrink`, and shows a notice when the auto-compact threshold
   is missing or above `thresholdWarnAbove`.
@@ -160,6 +191,7 @@ top raw passages marked unverified. "Not found" comes with the 3 closest leads. 
 |---|---|
 | Haiku fails, refuses or times out (60 s; 90 s at `high`) | code-only handoff, with a notice |
 | Index or archive write fails | handoff still installed; recall says the index is unavailable |
+| Session index unreadable or its merge fails | handoff with the 0.2.x Files touched and Names in play |
 | Any error in the shrink | the engine's own compaction |
 | No valid tail start | keep from the last user message with text; else the engine's compaction |
 | Recall finds nothing | "not found" with the closest leads, no Haiku call |
@@ -177,7 +209,7 @@ top raw passages marked unverified. "Not found" comes with the 3 closest leads. 
 ## 8. Testing
 - Unit tests for each pure module, over small hand-built conversations and an invented 72-message session
   (`fixtures/sample-session.ts`).
-- Hook tests with Claude Code's plugin test kit: modes, fallbacks, precompute skip, subagent pass-through,
+- Hook tests with Claude Code's plugin test kit: modes, fallbacks, precompute skip, subagent shrinks,
   budget, map and merge, effort retry, recall, the bar and the panel.
 - Retrieval golden set (`fixtures/golden.ts`): 12 answerable questions and 2 unanswerable ones. The answer must
   be in the top 8 hits (apart from listed known misses) and in the evidence for at least 11 of 12, and both

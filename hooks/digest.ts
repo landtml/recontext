@@ -7,15 +7,15 @@
 
 import type { SessionMessage, ToolUseSummary } from 'claude-code'
 import { lineNo } from './archive'
-import { HEADER as FACTS_HEADER, callSummary, firstErrorLine, noMatchExit, personText, shellParts } from './facts'
+import { HEADER as FACTS_HEADER, callSummary, firstErrorLine, isShrinkCommand, noMatchExit, personText, shellParts } from './facts'
 import { HANDOFF_HEADER } from './prompt'
-import { qualifyRefs } from './refs'
+import { qualifyForeign, qualifyRefs } from './refs'
+import { ENGINE_SUMMARY } from './util'
 
 // 0.2.8: 8000 and 6000 (were 4000 and 2000). At 2000, 12% of assistant texts were cut and Haiku reported them as
 // unfinished; at 6000 none of 647 real ones is. The token budget still trims a digest that grows too big.
 const USER_CHARS = 8000
 const ASSISTANT_CHARS = 6000
-const ENGINE_SUMMARY = 'This session is being continued from a previous conversation'
 
 /** The digest's cut marker (0.2.8): says how much is left out, so the line cannot read as an unfinished message. */
 export const cutMark = (left: number): string => `…[+${left} chars, full text archived]`
@@ -45,6 +45,42 @@ export function previousStateOf(messages: readonly SessionMessage[]): string | u
     if (stripped.startsWith(HANDOFF_HEADER) || stripped.startsWith(ENGINE_SUMMARY)) previous = stateBody(stripped)
   }
   return previous
+}
+
+export type HandoffSource = { sid8: string; k: number; path: string }
+const ARCHIVE_LINE = /^- Archive: `?(\S*?\/\d{4}-\d{2}-\d{2}_([A-Za-z0-9]+)-(\d+)\.txt)/m
+
+/** The session and shrink whose archive a handoff names under "Where to look" (0.2.11), or undefined. */
+export function handoffSource(text: string): HandoffSource | undefined {
+  const m = ARCHIVE_LINE.exec(text)
+  return m ? { sid8: m[2]!, k: Number(m[3]), path: m[1]! } : undefined
+}
+
+/** The source of the previous handoff the messages hold (the last one, as `previousStateOf` takes), or undefined. */
+export function previousSourceOf(messages: readonly SessionMessage[]): HandoffSource | undefined {
+  let source: HandoffSource | undefined
+  for (const m of messages) {
+    if (m.role !== 'user') continue
+    const stripped = m.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
+    if (stripped.startsWith(HANDOFF_HEADER)) source = handoffSource(stripped)
+    else if (stripped.startsWith(ENGINE_SUMMARY)) source = undefined
+  }
+  return source
+}
+
+/**
+ * A previous state with its refs made exact: a handoff another session wrote (`sid8` given and different) cites
+ * that session's archives as `sid8-k#n` (0.2.11); this session's own cites archive `prevK` as `#prevK:n` (0.2.3).
+ */
+function qualifyPrevious(state: string, source: HandoffSource | undefined, prevK?: number, sid8?: string): string {
+  if (source && sid8 && source.sid8 !== sid8) return qualifyForeign(state, source.sid8, source.k)
+  return prevK !== undefined && prevK >= 1 ? qualifyRefs(state, prevK) : state
+}
+
+/** The previous state as the digest shows it (`qualifyPrevious`), or '' when the messages hold none. */
+export function qualifiedPrevious(messages: readonly SessionMessage[], prevK?: number, sid8?: string): string {
+  const previous = previousStateOf(messages)
+  return previous === undefined ? '' : qualifyPrevious(previous, previousSourceOf(messages), prevK, sid8)
 }
 
 export type DigestKind = 'result' | 'tool' | 'assistant' | 'user'
@@ -132,8 +168,11 @@ export function resultLine(tool: string, text: string): string | undefined {
   return flatOut.length <= RESULT_CHARS ? flatOut : `${flatOut.slice(0, RESULT_CHARS)}…`
 }
 
-/** The previous state and one line per user text, assistant text and tool call, uncut. `prevK` as in buildDigest. */
-export function digestParts(messages: readonly SessionMessage[], prevK?: number): DigestParts {
+/**
+ * The previous state and one line per user text, assistant text and tool call, uncut. `prevK` as in buildDigest;
+ * `sid8`: this session, so a previous handoff another session wrote keeps that session's refs (0.2.11).
+ */
+export function digestParts(messages: readonly SessionMessage[], prevK?: number, sid8?: string): DigestParts {
   const rows = new Map<string, { text: string; isError: boolean }>()
   for (const m of messages) for (const r of m.toolResults ?? []) rows.set(r.tool_use_id, { text: r.text, isError: r.isError })
   const failed = (u: ToolUseSummary): string | undefined => {
@@ -168,7 +207,7 @@ export function digestParts(messages: readonly SessionMessage[], prevK?: number)
         previous = stateBody(stripped)
         return
       }
-      const said = personText(m.text)
+      const said = isShrinkCommand(m.text) ? undefined : personText(m.text)
       if (said !== undefined) lines.push({ kind: 'user', n, text: `#${n} user: ${flat(cut(said, USER_CHARS))}` })
       return
     }
@@ -180,7 +219,7 @@ export function digestParts(messages: readonly SessionMessage[], prevK?: number)
       if (result !== undefined) lines.push({ kind: 'result', n, text: `#${n} result: ${result}` })
     }
   })
-  if (previous !== undefined && prevK !== undefined && prevK >= 1) previous = qualifyRefs(previous, prevK)
+  if (previous !== undefined) previous = qualifyPrevious(previous, previousSourceOf(messages), prevK, sid8)
   return { previous, lines }
 }
 

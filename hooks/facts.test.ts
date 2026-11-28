@@ -1,7 +1,8 @@
 import type { SessionMessage, ToolUseSummary } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
 import { buildArchive } from './archive'
-import { HEADER, answersOf, buildFacts, commandKey, firstErrorLine, noMatchExit, personText, recipeForm, shellWrites, type FactsOptions } from './facts'
+import { HEADER, answersOf, buildFacts, commandKey, firstErrorLine, indexSlice, noMatchExit, personText, recipeForm, shellWrites, type FactsOptions } from './facts'
+import type { IndexEntry } from './index'
 import { HANDOFF_HEADER } from './prompt'
 
 const OPTS: FactsOptions = {
@@ -77,6 +78,13 @@ test('reminders and machine rows never reach the facts; N comes from the options
   expect(section(facts, 'Earlier messages')).toEqual(['- #1 real one'])
   expect(facts).not.toContain('secret context')
   expect(facts).not.toContain('agent done')
+})
+
+test('0.2.11: a shrink command typed alone is not a verbatim message; the next older one takes its place', () => {
+  const SHRINK_NOW = '<command-name>/shrink</command-name>\n<command-message>shrink</command-message>\n<command-args>now</command-args>'
+  const facts = buildFacts([user('fix the gate'), asst(), user(SHRINK_NOW)], OPTS)
+  expect(section(facts, "The user's last messages, verbatim")).toEqual(['### #1', 'fix the gate'])
+  expect(facts).not.toContain('/shrink now')
 })
 
 test('a verbatim message is cut at 4,000 chars, pointing at its archive line', () => {
@@ -607,7 +615,7 @@ test('firstErrorLine: a shell error beats file content that mentions errors (0.2
 
 // regression: `…; diff before after && echo SAME` exited 1 because the files differed
 const DIFFED = "Exit code 1\n5:(2) ranks\nEXIT=0\n2c2\n< 'q one' | 14 | 14\n---\n> 'q one' | 14 | 9"
-const DIFF_CMD = 'cd /p && grep -n "rank\\|RANK" a.py | head -12; S=/s; python3 run.py > $S/after.txt 2>&1; echo EXIT=$?; diff $S/before.txt $S/after.txt && echo SAME'
+const DIFF_CMD = 'cd /p && grep -n "rank\\|RANK" a.py | head -12; S=/s; python3 run.py > $out/after.txt 2>&1; echo EXIT=$?; diff $out/before.txt $out/after.txt && echo SAME'
 
 test('noMatchExit: exit 1 from a last grep, rg, diff or cmp with other output and no error line (0.2.10)', () => {
   expect(noMatchExit(DIFF_CMD, DIFFED)).toBe(true)
@@ -635,4 +643,57 @@ test('failed commands: a compound command whose only failure is a last diff or g
     OPTS,
   )
   expect(section(facts, 'Failed commands and errors')).toEqual(['- #1 Bash: grep -n foo a.py → Exit code 1; no output'])
+})
+
+test('Where to look names the archive of the session this one continues, when another session wrote the handoff (0.2.11)', () => {
+  const facts = buildFacts([user('fix it')], { ...OPTS, continuesArchive: '/h/archive/2026-11-26_4a9e7c13-3.txt' })
+  expect(facts).toContain('- Archive of the session this one continues (its refs read `4a9e7c13-k#n`): /h/archive/2026-11-26_4a9e7c13-3.txt')
+  expect(buildFacts([user('fix it')], OPTS)).not.toContain('this one continues')
+})
+
+const ent = (item: string, kind: IndexEntry['kind'], marks = '', refs = ['1:1']): IndexEntry =>
+  ({ item, kind, typed: 1, shown: 0, win: 0, marks, lastSeg: 1, lastPos: 1, refs })
+
+test('indexSlice writes each item in full, best ranked first, with no folder grouping or refs', () => {
+  const ranked = [ent('~/p/hooks/a.py', 'path', 'E', ['1:3', '46:12']), ent('buildFacts', 'camel'), ent('~/p/hooks/b.py', 'path', 'R'), ent('0.2.12', 'ver')]
+  const s = indexSlice(ranked, 5000, () => false)
+  expect(s.lines).toEqual(['- `~/p/hooks/a.py` `buildFacts` `~/p/hooks/b.py` `0.2.12`'])
+  expect(s).toMatchObject({ packed: 4, more: 0 })
+})
+
+test('indexSlice keeps to its budget (2 chars per est. token) in short lines, and counts the rest', () => {
+  const ranked = Array.from({ length: 400 }, (_, i) => ent(`~/proj/dir${i % 7}/file_${i}.ts`, 'path', 'R'))
+  const s = indexSlice(ranked, 300, () => false)
+  const text = s.lines.map(l => `${l}\n`).join('')
+  expect(text.length).toBeLessThanOrEqual(600)
+  expect(s.lines.length).toBeGreaterThan(1)
+  expect(Math.max(...s.lines.map(l => l.length))).toBeLessThanOrEqual(400)
+  expect(text).toContain('`~/proj/dir0/file_0.ts`')
+  expect(text).not.toContain('file_399.ts')
+  expect(s.more + s.packed).toBe(400)
+})
+
+test('indexSlice passes over an item too big to fit, so a smaller one later still fits', () => {
+  const s = indexSlice([ent('x'.repeat(30), 'camel'), ent('small_one', 'camel')], 10, () => false)
+  expect(s).toEqual({ lines: ['- `small_one`'], packed: 1, more: 1 })
+})
+
+test('indexSlice skips what the state already holds; an empty index gives nothing', () => {
+  const s = indexSlice([ent('~/p/a_file.py', 'path'), ent('fooBar', 'camel')], 5000, it => it === 'fooBar')
+  expect(s.lines).toEqual(['- `~/p/a_file.py`'])
+  expect(indexSlice([], 5000, () => false)).toEqual({ lines: [], packed: 0, more: 0 })
+})
+
+test('with a ranked index, the slice replaces Files touched and Names in play; Commands that worked stays', () => {
+  const msgs: SessionMessage[] = [
+    { role: 'user', text: 'fix it', toolUses: [] },
+    { role: 'assistant', text: 'reading tools/x_file.py', toolUses: [{ tool_use_id: 't1', tool: 'Read', input: { file_path: '/p/tools/x_file.py' }, text: 'x' }] },
+  ]
+  const plain = buildFacts(msgs, OPTS)
+  expect(plain).toContain('## Files touched')
+  const sliced = buildFacts(msgs, { ...OPTS, ranked: [ent('/p/tools/x_file.py', 'path', 'R'), ent('heldName', 'camel')], stateText: 'heldName is done' })
+  expect(sliced).not.toContain('## Files touched')
+  expect(sliced).not.toContain('## Names in play')
+  expect(sliced).toContain('## Items in play (exact names from the session index, best ranked first)\n- `/p/tools/x_file.py`')
+  expect(sliced).not.toContain('`heldName`')
 })

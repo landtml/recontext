@@ -3,6 +3,7 @@
 // Pure.
 
 import type { SourceKind, Unit } from './units'
+import { escapeRe } from './util'
 
 export const READER_SYSTEM = `You answer a question about an earlier part of a coding session, using only the evidence blocks in the user message. Each block is a piece of the archived conversation: source="user" is the user's own words, "tool" is a tool's output, "assistant" is what the assistant said at the time, "handoff" is an earlier summary.
 
@@ -60,6 +61,35 @@ export function readerPrompt(question: string, evidenceText: string, feedback?: 
   return parts.join('\n\n')
 }
 
+/** The retry note for a reply that stopped before its JSON closed (G0:cut, 0.3.0). */
+export const CUT_FEEDBACK = 'G0:cut: your reply stopped before the JSON closed; answer in under 120 words, at most 4 citations'
+
+/** A reply whose JSON object opens but never closes (out of output tokens): strings and escapes are skipped. */
+export function isCut(text: string): boolean {
+  const start = text.indexOf('{')
+  if (start < 0) return false
+  let depth = 0
+  let inString = false
+  for (let i = start; i < text.length; i++) {
+    const c = text[i]
+    if (inString) {
+      if (c === '\\') i++
+      else if (c === '"') inString = false
+    } else if (c === '"') inString = true
+    else if (c === '{' || c === '[') depth++
+    else if (c === '}' || c === ']') {
+      depth--
+      if (depth === 0) return false
+    }
+  }
+  return true
+}
+
+/** The gate problem for a reply that is not a draft. */
+export function notDraftProblem(text: string): string {
+  return isCut(text) ? 'G0:cut' : 'G0:not_json'
+}
+
 /** Haiku's reply as a draft: plain or fenced JSON; undefined for anything else. */
 export function parseDraft(text: string): Draft | undefined {
   const fenced = /```(?:json)?\s*([\s\S]*?)```/.exec(text)?.[1]
@@ -84,16 +114,19 @@ export function parseDraft(text: string): Draft | undefined {
 }
 
 const MARKER = /\[(E\d+)\]/g
-/** A value: a version string (0.2.5) or clock time (01:30:10) as one token, else a number like 4,306 or 0.70 (0.2.9). */
-const NUMBER_SRC = String.raw`\d+(?:\.\d+){2,}|\d{1,2}:\d{2}(?::\d{2})?|\d[\d,]*(?:\.\d+)?`
+/** A value: a version string (0.2.5) or clock time (01:30:10) as one token, else a number like 1,872 or 0.70 (0.2.9). */
+const NUMBER_SRC = String.raw`\d+(?:\.\d+){2,}|\d{1,2}:\d{2}(?::\d{2})?|\d(?:,?\d)*(?:\.\d+)?`
 const NUMBER = new RegExp(NUMBER_SRC, 'g')
 /** A value with the letters written right after it ("35ms", "2m"), as one source must hold it. */
 const VALUE = new RegExp(`(${NUMBER_SRC})([A-Za-z%]*)`, 'g')
+/** 2026-11-27T19:03:00.123Z, with or without seconds, fraction, Z or offset. */
+const ISO_STAMP = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?/g
 const normalize = (s: string): string => s.replace(/\s+/g, ' ').trim()
-const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
-/** A run with a letter or _ before a digit: an evidence id (E6), agent (A7), file (REPORT-2.md), path or hash. */
-const IDENTIFIER = /[A-Za-z_][\w\-./]*?\d[\w\-./]*/g
+/** A run with a letter or _ before a digit: an evidence id (E6), agent (A7), file (REPORT-2.md), path or hash;
+ *  or a hex id that opens with a digit, as session ids (381507e4-...) and git hashes (7d2b9e1) do:
+ *  6+ hex characters with a letter and a digit after it. 1920x1080, 35ms or 2x stay values. */
+const IDENTIFIER = /[A-Za-z_][\w\-./]*?\d[\w\-./]*|(?<![\w.])(?=[0-9a-f]{6})\d[0-9a-f]*[a-f][0-9a-f]*\d[\w\-./]*/g
 /** "1." or "2)" opening a line: list numbering, not a value. */
 const LIST_NUMBER = /^[ \t]*\d+[.)](?=\s)/gm
 
@@ -111,7 +144,13 @@ function numbers(text: string, asSource = false): Set<string> {
 /** The text holds this value (number plus attached letters) as a whole token, with or without its commas. */
 function holdsValue(text: string, raw: string): boolean {
   const forms = new Set([raw, raw.replace(/,/g, '')])
-  return [...forms].some(f => new RegExp(`(?<![\\w.,:])${escapeRe(f)}(?![\\w]|[.,:]\\d)`).test(text))
+  // a clock time (0.2.11) may sit in an ISO timestamp, right after its T, with seconds, a fraction and Z
+  const clock = /^\d{1,2}:\d{2}(?::\d{2})?$/.test(raw.replace(/,/g, ''))
+  return [...forms].some(f => {
+    if (!clock) return new RegExp(`(?<![\\w.,:])${escapeRe(f)}(?![\\w]|[.,:]\\d)`).test(text)
+    const tail = /^\d{1,2}:\d{2}:\d{2}$/.test(f) ? String.raw`(?:\.\d+)?Z?` : String.raw`(?::\d{2}(?:\.\d+)?)?Z?`
+    return new RegExp(`(?:(?<![\\w.,:])|(?<=\\dT))${escapeRe(f)}${tail}(?![\\w]|[.,:]\\d)`).test(text)
+  })
 }
 
 /** JSON string escapes decoded: units hold tool inputs as JSON, so a quote of the prompt sees \n, not a newline (0.2.9). */
@@ -137,6 +176,37 @@ function quoteFound(quote: string, text: string): boolean {
   return new RegExp(prefix + escapeRe(quote) + suffix).test(text)
 }
 
+/** Whether evidence e holds the quote word for word (spaces folded, JSON escapes read either way). */
+function holdsQuote(e: Evidence, quote: string): boolean {
+  const q = normalize(quote)
+  return q !== '' && (quoteFound(q, normalize(e.unit.text)) || quoteFound(q, normalize(unescapeJson(e.unit.text))))
+}
+
+/** G2 repair (0.3.0): a citation whose quote is not in the unit it names but is, word for word, in another
+ *  evidence unit (6 of 7 logged rejects: the id one off) is moved to the nearest unit holding it, with the
+ *  answer's [En] marker when no other citation keeps that id. A quote no unit holds is left for G2 to reject. */
+export function relabelCitations(d: Draft, evidence: readonly Evidence[]): Draft {
+  if (d.abstain) return d
+  const byId = new Map(evidence.map(e => [e.id, e]))
+  const num = (id: string) => Number(id.slice(1))
+  const moved = new Map<string, Set<string>>()
+  const citations = d.citations.map(c => {
+    const e = byId.get(c.id)
+    if (e && holdsQuote(e, c.quote)) return c
+    const holders = evidence.filter(x => holdsQuote(x, c.quote))
+    if (holders.length === 0) return c
+    const near = holders.reduce((a, b) => (Math.abs(num(b.id) - num(c.id)) < Math.abs(num(a.id) - num(c.id)) ? b : a))
+    if (!moved.has(c.id)) moved.set(c.id, new Set())
+    moved.get(c.id)!.add(near.id)
+    return { ...c, id: near.id }
+  })
+  const kept = new Set(citations.map(c => c.id))
+  let answer = d.answer
+  for (const [from, to] of moved)
+    if (!kept.has(from) && to.size === 1) answer = answer.replace(new RegExp(`\\[${from}\\]`, 'g'), `[${[...to][0]}]`)
+  return { ...d, answer, citations }
+}
+
 /** governed-rag's gates G1-G3; [] when the draft passes (an abstention always passes).
  *  A number the question itself gives counts as sourced. */
 export function checkDraft(d: Draft, evidence: readonly Evidence[], question = ''): string[] {
@@ -152,9 +222,7 @@ export function checkDraft(d: Draft, evidence: readonly Evidence[], question = '
   for (const c of d.citations) {
     const e = byId.get(c.id)
     if (!e) continue
-    const q = normalize(c.quote)
-    if (q === '' || !(quoteFound(q, normalize(e.unit.text)) || quoteFound(q, normalize(unescapeJson(e.unit.text)))))
-      failures.push(`G2:quote_not_found:${c.id}`)
+    if (!holdsQuote(e, c.quote)) failures.push(`G2:quote_not_found:${c.id}`)
   }
   // G3: a value is sourced by the question, by any quote, or (0.2.9) by the text of a unit its own sentence cites;
   // an answer with no [En] marker at all (most real drafts) cites its whole citation list in every sentence
@@ -165,7 +233,10 @@ export function checkDraft(d: Draft, evidence: readonly Evidence[], question = '
   for (const s of parts) {
     const ids = marked ? s.ids : [...cited]
     const texts = ids.flatMap(id => (isCited(id) ? [byId.get(id)!.unit.text] : []))
-    for (const m of valueText(s.text, true).matchAll(VALUE)) {
+    // an ISO timestamp (0.3.0) is one value: the IDENTIFIER strip would eat its T19 and strand 27, 03:00, .123
+    const verbatim = [question, ...d.citations.map(c => c.quote), ...texts]
+    const text = s.text.replace(ISO_STAMP, iso => (verbatim.some(t => t.includes(iso)) ? ' ' : iso))
+    for (const m of valueText(text, true).matchAll(VALUE)) {
       const n = m[1]!.replace(/,/g, '')
       if (sourced.has(n)) continue
       if (texts.some(t => holdsValue(t, m[0]))) continue

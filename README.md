@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/landtml/recontext/releases/latest"><img alt="Release" src="https://img.shields.io/badge/release-v0.2.10-D63A3A"></a>
+  <a href="https://github.com/landtml/recontext/releases/latest"><img alt="Release" src="https://img.shields.io/badge/release-v0.3.0-D63A3A"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
   <img alt="Claude Code plugin" src="https://img.shields.io/badge/Claude%20Code-plugin-D97757">
   <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&amp;logoColor=white">
@@ -76,12 +76,15 @@ compaction (auto threshold or /compact)
             a larger digest is split into up to 6 parts, noted separately, then merged
   5. CODE   check every archive ref (#n, or #k:n for shrink k's archive): refs past an archive's end are
             repaired from the previous handoff or dropped, refs to empty lines are dropped
-  6. CODE   add exact facts: your last messages verbatim, files touched, failed commands, URLs, agents,
-            and any message you sent while Claude was working
+  6. CODE   add exact facts: your last messages verbatim, failed commands, URLs, agents, any message
+            you sent while Claude was working, and the items in play: a ranked slice of the session
+            index (every path, file, id and name the session used, merged at each shrink)
   7. CODE   keep the last messages word for word (tool calls paired with their results)
   -> the new context is the handoff plus that tail; the session model is never called
 
 recall(question, leads)   a tool Claude calls when it needs a detail from before a shrink
+  0. CODE   exact lookup: a question that names an indexed item is answered from the session index and
+            its archive lines, with no model call; if those lines do not answer it, they go first
   1. CODE   search the index: BM25 + exact matches on paths and identifiers + quoted phrases,
             fused by reciprocal rank fusion; neighbours and call/result partners added as evidence
   2. HAIKU  answer from the evidence only, citing each claim with a quote
@@ -156,7 +159,7 @@ threshold is above `thresholdWarnAbove` (default `200000`).
 **By hand.** You can shrink at any time with `/compact`, optionally with a focus: `/compact the export bug`.
 `/shrink now [focus]` does the same from the mod's own command and runs `/compact` once the session is idle.
 
-**Subagents** keep Claude Code's built-in compaction; only the main session is shrunk.
+**Subagents** are shrunk the same way, quietly: no toast and no panel row. Their files carry a `sub…` label.
 
 ## What you see
 
@@ -196,6 +199,7 @@ Everything stays on your machine, in `~/.claude/projects/<project>/handoffs/` (o
 | `session-handoff_<date>_<session>-<n>.md` | the handoff each shrink installed |
 | `archive/<date>_<session>-<n>.txt` | the compacted conversation, one line per message (greppable) |
 | `index/*.jsonl` | the search index recall uses |
+| `items/<session>.jsonl` | the session index: every exact item with its counts and refs |
 
 It writes no logs or usage data. `claude --debug` shows one trace line per shrink and recall.
 
@@ -212,7 +216,8 @@ The only model calls are the Haiku calls, made through Claude Code's own model a
 - **The number check is strict.** An answer that mentions a number found neither in its quotes nor in the
   question fails the check, and after one retry recall returns raw passages, not a guessed number. Evidence
   labels, list numbering and digits inside names (`A7`, `J412`) are not counted as numbers.
-- **Subagents keep the built-in compaction.**
+- **Exact lookup covers the main session.** A subagent's recall searches its own and the session's archives,
+  but answers only through the search and Haiku.
 
 ## Uninstall
 

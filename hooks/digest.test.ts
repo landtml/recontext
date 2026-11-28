@@ -2,7 +2,7 @@ import type { SessionMessage } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
 import { messages as sample } from '../fixtures/sample-session'
 import { buildArchive } from './archive'
-import { buildDigest, digestParts, previousStateOf, readOnlyShell, renderDigest } from './digest'
+import { buildDigest, digestParts, handoffSource, previousSourceOf, previousStateOf, qualifiedPrevious, readOnlyShell, renderDigest } from './digest'
 import { HANDOFF_HEADER } from './prompt'
 
 const user = (text: string): SessionMessage => ({ role: 'user', text, toolUses: [] })
@@ -257,4 +257,63 @@ test('a Bash call sent to the background says so, not the harness note after it 
   // regression: the result line was "Session cwd remains …"
   const out = 'Command running in background with ID: b3z9ushfl. Output is being written to: /tmp/x/b3z9ushfl.output\nSession cwd remains /p; directory changes made by the backgrounded command do not apply'
   expect(call('Bash', { command: 'python3 long.py > out.txt', run_in_background: true }, out)[2]).toBe('#2 result: (started in the background)')
+})
+
+// 0.2.11: a handoff another session wrote (a fork, or a resume under a new id) cites that session's archives
+const handoffOf = (sid8: string, k: number) =>
+  user(
+    `${HANDOFF_HEADER}\n(This is shrink ${k} of this session.)\n\n## State of work\n## Goal\nfix the gate (#40, #2:17); \`#7\` is a mention\n\n` +
+      `# Handoff facts (exact, extracted by code)\n## Where to look\n- Archive: /h/p/handoffs/archive/2026-11-26_${sid8}-${k}.txt (one line per message: \`#n role tool | text\`)\n` +
+      `- Earlier archives (\`#k:n\` is line n of shrink k's archive: 1, 2), in /h/p/handoffs/archive/: 2026-11-26_${sid8}-1.txt, 2026-11-26_${sid8}-2.txt`,
+  )
+
+test('handoffSource: the session and shrink of the archive a handoff names (0.2.11)', () => {
+  expect(handoffSource(handoffOf('4a9e7c13', 3).text)).toEqual({ sid8: '4a9e7c13', k: 3, path: '/h/p/handoffs/archive/2026-11-26_4a9e7c13-3.txt' })
+  expect(handoffSource('# Handoff\nno archive here')).toBeUndefined()
+  expect(previousSourceOf([handoffOf('4a9e7c13', 3), ...CONVO])?.sid8).toBe('4a9e7c13')
+  expect(previousSourceOf([handoffOf('4a9e7c13', 3), handoffOf('6b0d4e1a', 1), ...CONVO])?.sid8).toBe('6b0d4e1a')
+  expect(previousSourceOf(CONVO)).toBeUndefined()
+})
+
+test("digestParts: a previous state from another session keeps that session's archives in its refs (0.2.11)", () => {
+  // the fork's first shrink: k = 1, so prevK = 0, and 0.2.10 left these refs plain (read later as the fork's #1:n)
+  const p = digestParts([handoffOf('4a9e7c13', 3), ...CONVO], 0, '6b0d4e1a').previous
+  expect(p).toContain('fix the gate (4a9e7c13-3#40, 4a9e7c13-2#17); `#7` is a mention')
+  expect(qualifiedPrevious([handoffOf('4a9e7c13', 3), ...CONVO], 0, '6b0d4e1a')).toBe(p)
+})
+
+test('digestParts: a previous state of this session, or with no session given, is qualified as before (0.2.11)', () => {
+  expect(digestParts([handoffOf('6b0d4e1a', 3), ...CONVO], 3, '6b0d4e1a').previous).toContain('fix the gate (#3:40, #2:17)')
+  expect(digestParts([handoffOf('4a9e7c13', 3), ...CONVO], 3).previous).toContain('fix the gate (#3:40, #2:17)')
+  expect(qualifiedPrevious([handoffOf('6b0d4e1a', 3), ...CONVO], 3, '6b0d4e1a')).toContain('(#3:40, #2:17)')
+  expect(qualifiedPrevious(CONVO, 3, '6b0d4e1a')).toBe('')
+})
+
+const SHRINK_NOW = '<command-name>/shrink</command-name>\n<command-message>shrink</command-message>\n<command-args>now</command-args>'
+const COMPACT = '<command-name>/compact</command-name><command-message>compact</command-message><command-args></command-args>'
+const COMPACT_FOCUS = '<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args>focus on X</command-args>'
+
+test('0.2.11: a shrink or compact command typed alone gets no user line; other lines keep their numbers', () => {
+  const msgs = [
+    user('fix the gate'),
+    asst('ok'),
+    user(SHRINK_NOW),
+    user('/shrink now'),
+    user('/shrink now focus on X'),
+    user(COMPACT),
+    user(COMPACT_FOCUS),
+    user('can /shrink now fail?'),
+    user('/shrink help'),
+    user('<command-name>/shrink</command-name>\n<command-message>shrink</command-message>\n<command-args></command-args>'),
+  ]
+  expect(buildDigest(msgs, 100000)).toBe(
+    [
+      '## Conversation',
+      '#1 user: fix the gate',
+      '#2 assistant: ok',
+      '#8 user: can /shrink now fail?',
+      '#9 user: /shrink help',
+      '#10 user: /shrink',
+    ].join('\n'),
+  )
 })

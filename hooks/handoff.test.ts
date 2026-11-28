@@ -180,13 +180,18 @@ test('cleanReread keeps Windows paths (0.2.9)', () => {
   expect(cleanReread(s)).toBe('## Files to re-read first\n1. `C:\\p\\hooks\\facts` (x)')
 })
 
-test('both prompts explain result lines; version 0.2.10 (0.2.10)', () => {
+test('both prompts explain result lines; version 0.3.0 (0.2.10)', () => {
   for (const system of [STATE_SYSTEM, MAP_SYSTEM]) {
     expect(system).toContain('a `#n result:` line under it holds an excerpt of its output')
     expect(system).toContain('do not call its outcome unknown')
     expect(system).not.toContain('(with the first error line when a call failed)')
   }
-  expect(MOD_VERSION).toBe('0.2.10')
+  expect(MOD_VERSION).toBe('0.3.0')
+})
+
+test("both prompts say a ref into another session's archive is copied as written (0.2.11)", () => {
+  expect(STATE_SYSTEM).toContain("A ref like 4a9e7c13-3#40 is line 40 of another session's archive")
+  expect(MAP_SYSTEM).toContain("4a9e7c13-3#40 (another session's archive), are copied exactly as written")
 })
 
 test('both prompts forbid citing the Previous state (0.2.10)', () => {

@@ -15,19 +15,22 @@ import type {
 } from 'claude-code'
 import { buildArchive } from './archive'
 import { DEFAULT_BUDGET_TOKENS, IDENTITY_RESERVE_TOKENS, estimateRequest, estimateTokens } from './budget'
-import { digestParts, dropLines, previousStateOf, renderDigest, type DigestLine, type PartNote } from './digest'
+import { digestParts, dropLines, previousSourceOf, previousStateOf, qualifiedPrevious, renderDigest, type DigestLine, type PartNote } from './digest'
 import { missingSections } from './prompt'
 import { codeNote, fitNote, partNote, planShards } from './shard'
-import { archiveEmptyLines, archiveLineCount, checkRefs, qualifyRefs } from './refs'
+import { archiveEmptyLines, archiveLineCount, checkRefs, cleanDigestTalk } from './refs'
 import { buildFacts } from './facts'
+import { mergeIndex, parseIndex, rankEntries, seedFromParent, serializeIndex, type SessionIndex } from './index'
 import { MAP_SYSTEM, STATE_SYSTEM, buildHandoff, mapPrompt, pickTail, statePrompt, tailSize, trimTail } from './handoff'
-import { READER_SYSTEM, checkDraft, formatRecall, namedNote, parseDraft, readerPrompt, renderEvidence, type RecallOutcome } from './reader'
+import { formatLookup, lookup, lookupAnswers, type RefParts } from './lookup'
+import { CUT_FEEDBACK, READER_SYSTEM, checkDraft, formatRecall, namedNote, notDraftProblem, parseDraft, relabelCitations, readerPrompt, renderEvidence, type RecallOutcome } from './reader'
 import { MOD_VERSION, SHRINK_HELP, parseShrinkArgs } from './command'
 import { expand, RANKED_HITS, search } from './search'
 import { PANE_ID, PANE_TITLE, fillNow, recordFill, recordRecall, recordShrink, registerUi } from './ui'
 import { buildUnits, parseUnits, serializeUnits, type Unit } from './units'
 import { dirname, expandPath } from './paths'
 import { TAIL_BYTES, queuedMessages, queuedSection, unansweredQueued, type Queued } from './queued'
+import { escapeRe, pad } from './util'
 
 type Config = {
   mode: 'haiku' | 'code'
@@ -78,12 +81,10 @@ export function readConfig(o: PluginOptions): Config {
 
 /** An error's message, less the engine's `shrink: ` prefix (every toast already carries it). */
 const errText = (err: unknown): string => (err instanceof Error ? err.message : String(err)).replace(/^shrink: /, '')
-const pad = (n: number): string => String(n).padStart(2, '0')
 const ymd = (ms: number): string => {
   const d = new Date(ms)
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
 }
-const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 function toast($: EngineInterface, message: string): void {
   try {
@@ -168,6 +169,13 @@ async function contextNow($: EngineInterface): Promise<{ tokens?: number; thresh
   if (f.tokens !== undefined) return f
   const live = await $.session.usage().catch(() => undefined)
   return { tokens: live?.context.tokens, threshold: f.threshold }
+}
+
+/** `<session>/subagents/agent-<id>.jsonl` beside the session's transcript, or '' when it is not there. */
+async function subagentTranscript($: EngineInterface, transcriptPath: string, agentId: string): Promise<string> {
+  if (!transcriptPath.endsWith('.jsonl')) return ''
+  const path = `${transcriptPath.slice(0, -'.jsonl'.length)}/subagents/agent-${agentId}.jsonl`
+  return (await $.fs.exists(path).catch(() => false)) ? path : ''
 }
 
 type Asked = { text?: string; usage?: ModelUsage; why?: string; ms?: number; est: number; effort: ModelEffort }
@@ -261,8 +269,8 @@ async function stateCall($: EngineInterface, cfg: Config, prompt: string, calls:
  * The state of work (design 3.3): one call when the digest fits the budget, else map workers take notes on the
  * older slices and the state call merges them with the newest lines, read raw. Never rejects.
  */
-async function writeState($: EngineInterface, cfg: Config, messages: readonly SessionMessage[], prevK: number, focus?: string): Promise<StateRun> {
-  const { previous, lines: all } = digestParts(messages, prevK)
+export async function writeState($: EngineInterface, cfg: Config, messages: readonly SessionMessage[], prevK: number, focus?: string, sid8?: string): Promise<StateRun> {
+  const { previous, lines: all } = digestParts(messages, prevK, sid8)
   let lines: DigestLine[] = all
   let digestDropped = 0
   const full = renderDigest(previous, all)
@@ -339,27 +347,44 @@ async function readQueued($: EngineInterface, path: string, handed: readonly Ses
   return unansweredQueued(tail).filter(q => q.text === '' || !recent.some(t => t.includes(q.text)))
 }
 
-async function shrink($: EngineInterface, cfg: Config, e: SessionCompactInput, startedAt: number): Promise<SessionCompacted> {
+/**
+ * A subagent's files label (0.2.11): `sub` and the first 8 letters and digits of its id. Session labels are hex, so
+ * the two never meet, and `scanShrinks` counts each label's k on its own.
+ */
+export function agentLabel(agentId: string): string {
+  return `sub${(agentId.match(/[A-Za-z0-9]/g) ?? []).join('').slice(0, 8)}`
+}
+
+/** A subagent being shrunk (0.2.11): its id as the engine gives it, and its files label (`agentLabel`). */
+type Agent = { id: string; label: string }
+
+async function shrink($: EngineInterface, cfg: Config, e: SessionCompactInput, startedAt: number, agent?: Agent): Promise<SessionCompacted> {
   const start = pickTail(e.messages, cfg.tailChars)
   if (start < 0) throw new Error('no valid tail to keep')
 
   const sid = await $.session.id()
-  const sid8 = sid.slice(0, 8)
+  // a subagent's files carry its own label, so its refs read `sub…-k#n` and never point into the session's archives
+  const sid8 = agent?.label ?? sid.slice(0, 8)
   const transcriptPath = (await $.session.info().catch(() => undefined))?.transcriptPath ?? ''
+  // the subagent's own transcript sits beside the session's, under <session>/subagents/; named only when it is there
+  const ownTranscript = agent ? await subagentTranscript($, transcriptPath, agent.id) : transcriptPath
   const now = await $.clock.now()
   const date = ymd(now)
   const dir = await resolveDir($, cfg, transcriptPath)
   const { k, earlier, archives } = dir ? await scanShrinks($, dir, sid8) : { k: 1, earlier: [], archives: [] }
   const name = `${date}_${sid8}-${k}`
   const failures: string[] = []
-  const before = (await contextNow($)).tokens
+  // the context meter is the session's: a subagent's fill is not known here
+  const ctx = agent ? {} as { tokens?: number; threshold?: number } : await contextNow($)
+  const before = ctx.tokens
 
   // 0. messages queued mid-turn (0.2.9): carried at the top of the handoff and appended, as user messages, to what
   // the archive, index, digest and facts read; the tail stays the engine's own messages
   // a failed read goes to the debug log, not a problem: no file goes unwritten and the shrink is as in 0.2.8
   let queued: Queued[] = []
   let queuedError: string | undefined
-  if (transcriptPath)
+  // a queued message is the person's, sent to the session: never a subagent's
+  if (transcriptPath && !agent)
     try {
       queued = await readQueued($, transcriptPath, e.messages)
     } catch (err) {
@@ -372,6 +397,7 @@ async function shrink($: EngineInterface, cfg: Config, e: SessionCompactInput, s
   let indexed = false
   let archivePath: string | undefined
   let archiveText: string | undefined
+  let itemIndex: SessionIndex | undefined
   if (dir) {
     try {
       const parts = serializeUnits(units)
@@ -387,15 +413,36 @@ async function shrink($: EngineInterface, cfg: Config, e: SessionCompactInput, s
     } catch (err) {
       failures.push(`archive: ${errText(err)}`)
     }
+    // the session's item index (0.3.0): merged per shrink; a subagent's window is not the session's
+    if (!agent)
+      try {
+        const itemsPath = `${dir}/items/${sid8}.jsonl`
+        let prevIndex = parseIndex(await $.fs.read(itemsPath).catch(() => undefined) as string | undefined)
+        // a fork's first shrink starts from the parent's index, found beside the archive its inherited handoff names
+        const parent = prevIndex.head.k === 0 ? previousSourceOf(e.messages) : undefined
+        if (parent && parent.sid8 !== sid8) {
+          const parentItems = `${dirname(dirname(parent.path))}/items/${parent.sid8}.jsonl`
+          const text = await $.fs.read(parentItems).catch(() => undefined) as string | undefined
+          if (text) prevIndex = seedFromParent(parseIndex(text), parent.sid8)
+        }
+        itemIndex = mergeIndex(prevIndex, msgs, { k, home: await homeOf($) })
+        await $.fs.write(itemsPath, serializeIndex(itemIndex))
+      } catch (err) {
+        failures.push(`items: ${errText(err)}`)
+      }
   }
 
   // 3-4. digest and state of work
   const prevK = k - 1
-  const asked = await writeState($, cfg, msgs, prevK, e.instructions)
+  const asked = await writeState($, cfg, msgs, prevK, e.instructions, sid8)
   // refs past this archive's end are repaired from the previous state or dropped (0.2.3); new lines labelled
   // with the previous shrink's number go back to plain #n (0.2.4), unless Haiku read that #k:n in the digest (0.2.5)
+  // a handoff another session wrote keeps that session's refs, as the digest showed them (0.2.11)
   const previous = previousStateOf(e.messages)
-  const prevQualified = previous !== undefined && prevK >= 1 ? qualifyRefs(previous, prevK) : ''
+  const prevSource = previousSourceOf(e.messages)
+  const continuesArchive = prevSource && prevSource.sid8 !== sid8 ? prevSource.path : undefined
+  // with no earlier shrink of its own, only another session's handoff gives refs to repair from (as in 0.2.10 otherwise)
+  const prevQualified = prevK >= 1 || continuesArchive ? qualifiedPrevious(e.messages, prevK, sid8) : ''
   // refs to empty lines (no text, never in the digest) are dead: repaired from the previous state or dropped (0.2.7)
   const archiveLines = new Map<number, number>()
   const emptyByArchive = new Map<number, Set<number>>()
@@ -411,17 +458,21 @@ async function shrink($: EngineInterface, cfg: Config, e: SessionCompactInput, s
     ? checkRefs(asked.text, msgs.length, prevQualified, archiveLines, prevK >= 1 ? prevK : undefined, asked.read, empty)
     : undefined
   if (refCheck) asked.text = refCheck.text
+  const cleaned = asked.text ? cleanDigestTalk(asked.text) : undefined
+  if (cleaned) asked.text = cleaned.text
 
   // 5-7. facts, handoff, tail
   const facts = buildFacts(msgs, {
     verbatimUserMessages: VERBATIM_USER_MESSAGES,
     factsBudgetChars: cfg.factsBudgetChars,
     archivePath,
-    transcriptPath: transcriptPath || undefined,
+    transcriptPath: ownTranscript || undefined,
     earlierResets: earlier,
     earlierArchives: archives,
+    continuesArchive,
     stateText: asked.text,
     home: await homeOf($),
+    ranked: itemIndex ? safeRank(itemIndex) : undefined,
   })
   const handoffText = buildHandoff({
     state: asked.text,
@@ -457,6 +508,9 @@ async function shrink($: EngineInterface, cfg: Config, e: SessionCompactInput, s
       `${queued.length ? `, queued ${queued.length}` : ''}${queuedError ? `, queued messages not read (${queuedError})` : ''}` +
       `${failures.length ? `, problems: ${failures.join('; ')}` : ''}`,
   )
+
+  // a subagent's shrink is not the person's: no panel row, no toast (its log row and files are enough)
+  if (agent) return { messages }
 
   try {
     const u = asked.usage
@@ -498,11 +552,11 @@ const RAW_SHOWN = 5
 /** Index shards by path; a shard is written once under a new name, so its parse never goes stale. */
 const shardCache = new Map<string, Unit[]>()
 
-async function loadUnits($: EngineInterface, dir: string, sid8: string, scope: Config['recallScope']): Promise<Unit[]> {
+async function loadUnits($: EngineInterface, dir: string, sid8: string, scope: Config['recallScope'], label?: string): Promise<Unit[]> {
   const entries = await $.fs.list(`${dir}/index`).catch(() => [])
   const names = entries
     .map(e => e.name)
-    .filter(n => n.endsWith('.jsonl') && (scope === 'project' || n.includes(`_${sid8}-`)))
+    .filter(n => n.endsWith('.jsonl') && (scope === 'project' || n.includes(`_${sid8}-`) || (label !== undefined && n.includes(`_${label}-`))))
     .sort()
   const units: Unit[] = []
   for (const name of names) {
@@ -521,19 +575,55 @@ async function loadUnits($: EngineInterface, dir: string, sid8: string, scope: C
 
 type RecallRow = { calls: number }
 
-async function recall($: EngineInterface, cfg: Config, question: string, leads: string[]): Promise<{ text: string; outcome: RecallOutcome['kind']; row: RecallRow }> {
+/** Exact lookup (0.3.0): the session's item index and the archive lines its refs name; undefined when none. */
+async function exactLookup($: EngineInterface, dir: string, sid8: string, question: string, leads: string[]) {
+  const raw = await $.fs.read(`${dir}/items/${sid8}.jsonl`).catch(() => undefined)
+  if (typeof raw !== 'string') return undefined
+  const idx = parseIndex(raw)
+  if (idx.entries.size === 0) return undefined
+  const home = await homeOf($)
+  // first pass: which archives the hits' refs name; then read only those
+  const want = new Set<string>()
+  const l0 = lookup(question, leads, idx, sid8, p => (want.add(`${p.sid8}-${p.k}`), undefined), home)
+  if (l0.hits.length === 0) return l0
+  const archives = new Map<string, string>()
+  for (const { name } of await $.fs.list(`${dir}/archive`).catch(() => [])) {
+    const m = /_([0-9a-f]{8})-(\d+)\.txt$/.exec(name)
+    if (m) archives.set(`${m[1]}-${m[2]}`, `${dir}/archive/${name}`)
+  }
+  const loaded = new Map<string, string | undefined>()
+  for (const key of want) {
+    const path = archives.get(key)
+    const text = path ? await $.fs.read(path).catch(() => undefined) : undefined
+    loaded.set(key, typeof text === 'string' ? text : undefined)
+  }
+  return lookup(question, leads, idx, sid8, (p: RefParts) => loaded.get(`${p.sid8}-${p.k}`), home)
+}
+
+async function recall($: EngineInterface, cfg: Config, question: string, leads: string[], agentId?: string): Promise<{ text: string; outcome: RecallOutcome['kind'] | 'lookup'; dir?: string; row: RecallRow }> {
   const row: RecallRow = { calls: 0 }
-  const done = (o: RecallOutcome) => ({ text: formatRecall(o), outcome: o.kind, row })
+  let pre = ''
+  const done = (o: RecallOutcome, dir?: string) => ({ text: pre + formatRecall(o, pre ? 6000 - pre.length : 6000), outcome: o.kind, dir, row })
   const sid8 = (await $.session.id()).slice(0, 8)
   const transcriptPath = (await $.session.info().catch(() => undefined))?.transcriptPath ?? ''
   const dir = await resolveDir($, cfg, transcriptPath)
   if (!dir) return done({ kind: 'unavailable', why: 'no handoff folder for this session (no transcript path; set handoffDir)' })
-  const units = await loadUnits($, dir, sid8, cfg.recallScope)
+  // exact lookup first (main session only: a subagent's window is not in the item index); never fails a recall
+  if (agentId === undefined) {
+    const found = await exactLookup($, dir, sid8, question, leads).catch(err => (void debug($, `lookup failed: ${errText(err)}`), undefined))
+    if (found && found.hits.length) {
+      if (lookupAnswers(found, question)) return { text: formatLookup(found, true), outcome: 'lookup', dir, row }
+      pre = `${formatLookup(found, false, 2500)}\n\n`
+    }
+  }
+  // a subagent reads its own shrinks too (0.2.11), and they come first on a tie
+  const label = agentId !== undefined ? agentLabel(agentId) : undefined
+  const units = await loadUnits($, dir, sid8, cfg.recallScope, label)
   if (units.length === 0)
     return done({ kind: 'unavailable', why: `nothing archived yet for this ${cfg.recallScope === 'project' ? 'project' : 'session'}` })
 
-  const hits = search(units, { question, leads }, { currentSession: sid8 })
-  if (hits.length === 0) return done({ kind: 'not-found', leads: [] })
+  const hits = search(units, { question, leads }, { currentSession: label ?? sid8 })
+  if (hits.length === 0) return done({ kind: 'not-found', leads: [] }, dir)
   const ceiling = cfg.haikuBudgetTokens - IDENTITY_RESERVE_TOKENS - estimateTokens(READER_SYSTEM) - estimateTokens(question) - READER_PROMPT_RESERVE_TOKENS
   const chosen = expand(units, hits, EVIDENCE_CHARS, ceiling, RANKED_HITS)
   const { text: evidenceText, evidence } = renderEvidence(chosen)
@@ -548,14 +638,15 @@ async function recall($: EngineInterface, cfg: Config, question: string, leads: 
   // A verified "not found" from the top hits: one more read with the top 24 and evidence up to the ceiling,
   // when that shows more than the first read did (design 4.3). Undefined: keep the first outcome.
   const widen = async (): Promise<RecallOutcome | undefined> => {
-    const wide = search(units, { question, leads }, { currentSession: sid8, top: WIDE_HITS })
+    const wide = search(units, { question, leads }, { currentSession: label ?? sid8, top: WIDE_HITS })
     const more = expand(units, wide, Infinity, ceiling)
     if (more.length <= chosen.length) return undefined
     const r = renderEvidence(more)
     const asked = await read(r.text, undefined, namedNote(r.evidence, wide))
     if (!asked.text) return undefined
-    const draft = parseDraft(asked.text)
-    const problems = draft === undefined ? ['G0:not_json'] : checkDraft(draft, r.evidence, question)
+    const parsed = parseDraft(asked.text)
+    const draft = parsed && relabelCitations(parsed, r.evidence)
+    const problems = draft === undefined ? [notDraftProblem(asked.text)] : checkDraft(draft, r.evidence, question)
     if (draft && problems.length === 0 && !draft.abstain) return { kind: 'answer', draft, evidence: r.evidence }
     return { kind: 'not-found', leads: wide.slice(0, LEADS_SHOWN).map(h => h.unit) }
   }
@@ -563,14 +654,15 @@ async function recall($: EngineInterface, cfg: Config, question: string, leads: 
   let feedback: string | undefined
   for (let attempt = 0; attempt < READER_ATTEMPTS; attempt++) {
     const asked = await read(evidenceText, feedback, note)
-    if (!asked.text) return done({ kind: 'raw', units: top(RAW_SHOWN), why: `the reader model ${asked.why ?? 'gave nothing'}` })
-    const draft = parseDraft(asked.text)
-    const problems = draft === undefined ? ['G0:not_json'] : checkDraft(draft, evidence, question)
+    if (!asked.text) return done({ kind: 'raw', units: top(RAW_SHOWN), why: `the reader model ${asked.why ?? 'gave nothing'}` }, dir)
+    const parsed = parseDraft(asked.text)
+    const draft = parsed && relabelCitations(parsed, evidence)
+    const problems = draft === undefined ? [notDraftProblem(asked.text)] : checkDraft(draft, evidence, question)
     if (draft && problems.length === 0) {
       if (!draft.abstain) return done({ kind: 'answer', draft, evidence })
       return done((await widen()) ?? { kind: 'not-found', leads: top(LEADS_SHOWN) })
     }
-    feedback = problems.join('; ')
+    feedback = problems.map(p => (p === 'G0:cut' ? CUT_FEEDBACK : p)).join('; ')
   }
   return done({ kind: 'raw', units: top(RAW_SHOWN), why: 'the answer could not be verified against the archive' })
 }
@@ -677,11 +769,18 @@ export const register: Register = (on, options) => {
   })
 
   on('session.compact', async ($, e, next) => {
-    if (e.agentId !== undefined) {
-      return next(e) // subagents keep the built-in
-    }
     if (e.trigger === 'precompute') return { skip: 'shrink: the shrink is made at the reset itself, by Haiku' }
     const startedAt = await $.clock.now().catch(() => 0)
+    if (e.agentId !== undefined) {
+      // a subagent is shrunk as the session is (0.2.11), quietly; on any failure the engine compacts it, as up to 0.2.10
+      const agent = { id: e.agentId, label: agentLabel(e.agentId) }
+      try {
+        return await shrink($, cfg, e, startedAt, agent)
+      } catch (err) {
+        await debug($, `subagent ${agent.label} shrink failed: ${errText(err)}`)
+        return next(e)
+      }
+    }
     try {
       return await shrink($, cfg, e, startedAt)
     } catch (err) {
@@ -693,12 +792,12 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: RECALL_TOOL }, async ($, e) => {
     const startedAt = await $.clock.now().catch(() => 0)
-    const args = e as unknown as { question?: unknown; leads?: unknown }
+    const args = e as unknown as { question?: unknown; leads?: unknown; agentId?: unknown }
     const question = typeof args.question === 'string' ? args.question.trim() : ''
     const leads = Array.isArray(args.leads) ? args.leads.filter((l): l is string => typeof l === 'string') : []
     if (question === '') return { result: 'Recall needs a question.' }
     try {
-      const r = await recall($, cfg, question, leads)
+      const r = await recall($, cfg, question, leads, typeof args.agentId === 'string' ? args.agentId : undefined)
       await recordRecall($, { at: startedAt, question, outcome: r.outcome, tries: r.row.calls }).catch(() => undefined)
       return { result: r.text }
     } catch (err) {
@@ -707,4 +806,9 @@ export const register: Register = (on, options) => {
       return { result: `Recall failed: ${errText(err)}. Grep the archive under the handoffs folder instead.` }
     }
   }).catch(() => ({ result: 'Recall failed. Grep the archive under the handoffs folder instead.' }))
+}
+
+// ranking must never fail a shrink: no index slice is the old behaviour
+function safeRank(idx: SessionIndex) {
+  try { return rankEntries(idx) } catch { return undefined }
 }

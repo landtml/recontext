@@ -24,6 +24,16 @@ export function qualifyRefs(text: string, k: number): string {
   return outsideCode(text, t => t.replace(PLAIN, (_m, n: string) => `#${k}:${n}`))
 }
 
+/**
+ * Refs of a handoff another session wrote (a fork, or a resume under a new id), as unit refs into that session's
+ * archives (0.2.11): `#n` → `sid8-k#n`, `#j:n` → `sid8-j#n`. Recall reads that form; refs in code spans stay.
+ */
+export function qualifyForeign(text: string, sid8: string, k: number): string {
+  return outsideCode(text, t =>
+    t.replace(QUALIFIED, (_m, j: string, n: string) => `${sid8}-${j}#${n}`).replace(PLAIN, (_m, n: string) => `${sid8}-${k}#${n}`),
+  )
+}
+
 export type RefCheck = {
   text: string
   plain: number
@@ -167,4 +177,49 @@ export function archiveLineCount(archive: string): number {
   let last = 0
   for (const m of archive.matchAll(/^#(\d+) /gm)) last = Math.max(last, Number(m[1]))
   return last
+}
+
+/** Lines that are about the code, not the reader's work: a file name (`digest.ts`), or a code word (0.2.11). */
+const TALK_GUARD = /digest\.[a-z]|digestParts|buildDigest|result line|digest line|digest cap|digest build/i
+/** "not in the digest", "not yet visible in the digest": the reader cannot see the digest, so the verb is kept and the rest dropped. */
+const TALK_NOT = /\b(not)( yet)? (?:(recorded|visible|shown|confirmed) )?in the digest\b/gi
+/** "the digest does not show": the subject becomes the conversation. */
+const TALK_DOES = /\bthe digest does not (show|confirm|say|mention)\b/gi
+
+/**
+ * Rewrite the handoff's talk about the digest (0.2.11) into talk about the conversation the reader sees. Applied outside
+ * code spans, line by line; a line that is about the code (TALK_GUARD) stays whole. Returns the count of rewrites.
+ */
+export function cleanDigestTalk(text: string): { text: string; rewrites: number } {
+  let rewrites = 0
+  const out = text.split('\n').map(line => {
+    if (TALK_GUARD.test(line)) return line
+    return outsideCode(line, t =>
+      outsideQuotes(t, u =>
+        u
+          .replace(TALK_NOT, (_m, not: string, yet: string | undefined, verb: string | undefined) => {
+            rewrites++
+            return `${not}${yet ?? ''} ${verb ?? 'recorded'}`
+          })
+          .replace(TALK_DOES, (m, verb: string) => {
+            rewrites++
+            return `${m.startsWith('T') ? 'The' : 'the'} conversation does not ${verb}`
+          }),
+      ),
+    )
+  })
+  return { text: out.join('\n'), rewrites }
+}
+
+/** A short quoted phrase ("…" or “…”) names the words rather than saying them, so it stays as written. */
+const QUOTED = /"[^"\n]{1,80}"|“[^”\n]{1,80}”/g
+
+function outsideQuotes(text: string, f: (t: string) => string): string {
+  let out = ''
+  let at = 0
+  for (const m of text.matchAll(QUOTED)) {
+    out += f(text.slice(at, m.index)) + m[0]
+    at = m.index! + m[0].length
+  }
+  return out + f(text.slice(at))
 }
