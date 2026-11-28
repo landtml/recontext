@@ -37,7 +37,14 @@ def style():
         'axes.spines.top': False, 'axes.spines.right': False, 'axes.grid': True, 'axes.axisbelow': True,
         'grid.color': P['grid'], 'grid.linewidth': 0.8, 'axes.titleweight': 'semibold', 'axes.titlesize': 14,
         'axes.titlecolor': P['ink'], 'axes.titlelocation': 'left', 'axes.titlepad': 14, 'svg.hashsalt': 'recontext',
+        'legend.frameon': False, 'legend.fontsize': 11, 'legend.labelcolor': P['ink'], 'legend.handlelength': 2.4,
+        'legend.columnspacing': 1.8,
     })
+
+
+def legend(ax, ncol):
+    """Legend under the plot, so it names each color without covering a line."""
+    ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.16), ncol=ncol)
 
 
 def cost(t):
@@ -58,35 +65,31 @@ def cycle():
         xs += [t, end]
         ys += [F, F + (end - t) * G]
         t = end
-    fig, ax = plt.subplots(figsize=(8.6, 3.8))
-    ax.fill_between(xs, ys, color=P['fill'], alpha=P['fill_alpha'], lw=0)
-    ax.plot(xs, ys, color=P['red'], lw=2.4)
-    ax.axhline(T, color=P['red_dk'], lw=1, ls=(0, (5, 4)))
-    ax.axhline(F, color=P['muted'], lw=1, ls=(0, (5, 4)))
-    ax.text(turns, T + 3, 'T: a shrink starts here', ha='right', color=P['red_dk'], fontsize=11)
-    ax.text(turns, F - 9, 'F: context right after a shrink', ha='right', color=P['muted'], fontsize=11)
+    fig, ax = plt.subplots(figsize=(8.6, 4.9))
+    ax.plot(xs, ys, color=P['red'], lw=2.4, label='context size, turn by turn')
+    ax.fill_between(xs, ys, color=P['fill'], alpha=P['fill_alpha'], lw=0, label='tokens re-read every turn')
     shrinks = [i * n for i in range(1, int(turns / n) + 1)]
-    ax.plot(shrinks, [T] * len(shrinks), 'o', color=P['red_dk'], ms=6, zorder=5)
+    ax.plot(shrinks, [T] * len(shrinks), 'o', color=P['red_dk'], ms=6, zorder=5, label='a shrink: one-off cost C')
+    ax.axhline(T, color=P['red_dk'], lw=1, ls=(0, (5, 4)), label='T: threshold, a shrink starts')
+    ax.axhline(F, color=P['muted'], lw=1, ls=(0, (5, 4)), label='F: floor, context after a shrink')
     ax.annotate('', xy=(n, T + 13), xytext=(0, T + 13), arrowprops=dict(arrowstyle='<->', color=P['ink'], lw=1))
     ax.text(n / 2, T + 16, 'one cycle = (T − F) / g turns', ha='center', fontsize=11)
-    ax.text(n * 1.5, 16, 'shaded area: tokens re-read, one turn after another', ha='center', fontsize=11)
-    ax.text(shrinks[1] + 1.5, T + 10, '● each shrink: one-off cost C', color=P['red_dk'], fontsize=11)
-    ax.set(xlim=(0, turns), ylim=(0, 128), xlabel='turns', title='Context size over a long session (T = 100k)')
+    ax.set(xlim=(0, turns), ylim=(0, 128), title='Context size over a long session (T = 100k)')
+    ax.set_xlabel('turns', labelpad=2)
     ax.set_xticks([])
     kfmt(ax.yaxis)
+    legend(ax, 2)
     return fig
 
 
 def curve():
     """Cost per turn against the threshold: reading rises, shrink overhead falls, the sum has a minimum."""
     ts = [F + 0.5 + i * 0.25 for i in range(int((300 - F - 0.5) / 0.25) + 1)]
-    fig, ax = plt.subplots(figsize=(8.6, 4.8))
-    ax.plot(ts, [(F + t) / 2 for t in ts], color=P['blue'], lw=2)
-    ax.plot(ts, [C * G / (t - F) for t in ts], color=P['shrink'], lw=2)
-    ax.plot(ts, [cost(t) for t in ts], color=P['red'], lw=3)
-    ax.text(200, (F + 200) / 2 - 16, 'reading the context: (F + T) / 2', color=P['blue'], fontsize=11)
-    ax.text(298, C * G / (298 - F) + 6, 'shrinks, spread over the cycle: C·g / (T − F)', ha='right', color=P['shrink'], fontsize=11)
-    ax.text(285, cost(285) + 7, 'total', ha='right', color=P['red'], fontsize=12, weight='semibold')
+    fig, ax = plt.subplots(figsize=(8.6, 5.4))
+    ax.plot(ts, [cost(t) for t in ts], color=P['red'], lw=3, label='total cost per turn')
+    ax.plot(ts, [(F + t) / 2 for t in ts], color=P['blue'], lw=2, label='reading the context: (F + T) / 2')
+    ax.plot(ts, [C * G / (t - F) for t in ts], color=P['shrink'], lw=2, label='shrinks, spread over a cycle: C·g / (T − F)')
+    ax.axvline(F, color=P['muted'], lw=1, ls=(0, (5, 4)), label='F: floor, no room to grow')
     for t, label, color, (lx, ly) in ((T_OPT, f'cheapest\n{T_OPT:.0f}k', P['red_dk'], (68, 140)),
                                       (100, f'100k\n+{100 * (cost(100) / cost(T_OPT) - 1):.0f}%', P['ink'], (118, 140)),
                                       (167, f'167k\n+{100 * (cost(167) / cost(T_OPT) - 1):.0f}%', P['ink'], (167, cost(167) + 14))):
@@ -95,12 +98,11 @@ def curve():
         ax.annotate(label, xy=(t, cost(t)), xytext=(lx, ly), ha='center', va='bottom', color=color, fontsize=11,
                     weight='semibold', linespacing=1.2,
                     arrowprops=None if t == 167 else dict(arrowstyle='-', color=color, lw=0.8, shrinkA=2, shrinkB=5))
-    ax.axvline(F, color=P['muted'], lw=1, ls=(0, (5, 4)))
-    ax.text(F + 1.5, 6, 'F: no room to grow', color=P['muted'], fontsize=11)
     ax.set(xlim=(30, 300), ylim=(0, 200), xlabel='threshold T: context size when a shrink starts',
            ylabel='cache-read tokens per turn', title='Cost per turn against the threshold')
     kfmt(ax.xaxis)
     kfmt(ax.yaxis)
+    legend(ax, 2)
     return fig
 
 
