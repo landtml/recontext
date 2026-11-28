@@ -22,6 +22,7 @@
   <a href="#how-it-works">How it works</a> ·
   <a href="#compatibility">Compatibility</a> ·
   <a href="#configuration">Configuration</a> ·
+  <a href="#choosing-the-threshold">Threshold</a> ·
   <a href="#limits">Limits</a> ·
   <a href="CHANGELOG.md">Changelog</a> ·
   <a href="CONTRIBUTING.md">Contributing</a>
@@ -41,7 +42,7 @@
 - **It can't break compaction.** Any error falls back to Claude Code's built-in compaction.
 
 ```
-shrink ▸ context 112k / 180k ▓▓▓▓▓▓░░░░ · 2 shrinks (Haiku, ~3 s each) · 3 recalls (2 answered)
+shrink ▸ context 82k / 100k ▓▓▓▓▓▓▓▓░░ · 2 shrinks (Haiku, ~3 s each) · 3 recalls (2 answered)
 ```
 <sup>The status bar above the prompt: context fill against the shrink point, shrinks so far, recalls answered.</sup>
 
@@ -132,7 +133,7 @@ Add these two lines to `~/.claude/settings.json` (merge them into the existing o
 ```json
 {
   "autoCompactEnabled": true,
-  "autoCompactWindow": 200000
+  "autoCompactWindow": 133000
 }
 ```
 
@@ -140,18 +141,17 @@ Then start a new session. Settings are read when a session starts, so an open se
 
 **What happens from then on:**
 
-1. Claude Code measures the context against the window you set. With `200000`, it starts a compaction at about
-   180k tokens and keeps the rest as a reserve.
+1. Claude Code measures the context against the window you set and keeps a reserve of about 33k tokens. With
+   `133000`, it starts a compaction at about 100k tokens.
 2. Recontext takes over that compaction. Code prunes the conversation into a digest, Haiku writes the state
    of work, and code adds the exact facts and keeps your last messages word for word. Your session model
    (Opus, for example) is not called.
 3. The session continues from the handoff. The bar above the prompt counts the shrink, and the `recall` tool
    can fetch any exact detail from the archive later.
 
-**Choosing the window.** `200000` is a good default. Because a shrink costs few tokens, compacting earlier
-costs little, and a smaller context makes every later request smaller and faster. A larger window (for example
-`400000` on a 1M-token model) compacts less often but sends more tokens on every request in between. Claude
-Code treats any value below `100000` as `100000`.
+**Choosing the window.** `133000` (a 100k threshold) is the recommended value. [Choosing the
+threshold](#choosing-the-threshold) shows where it comes from. A larger window compacts less often but sends
+more tokens on every request in between. Claude Code treats any value below `100000` as `100000`.
 
 **If it is off.** With `autoCompactEnabled: false`, nothing compacts on its own. At session start the mod shows a notice when auto-compaction is off or the
 threshold is above `thresholdWarnAbove` (default `200000`).
@@ -189,6 +189,96 @@ use the `/config` menu (each option is a row there) or `claude plugin configure 
 | `tailChars` | `24000` | Size limit of the messages kept word for word. |
 | `recallScope` | `project` | `session`: recall searches this session only. `project`: also this project's other sessions. |
 | `thresholdWarnAbove` | `200000` | Notice at session start when the auto-compact threshold is missing or above this. |
+
+## Choosing the threshold
+
+The threshold is the context size at which a shrink starts. It is a trade-off. On every turn, Claude Code sends
+the whole conversation again. Prompt caching makes the old part cheap, but not free: each cached token is billed
+at a tenth of the normal input price, on every turn. A large context therefore costs more on every turn. A
+shrink makes the context small again, but each shrink has a one-off cost. This section works out where the two
+costs balance.
+
+### The inputs
+
+All values are in tokens and were measured from Claude Code session transcripts, using automatic shrinks only
+(77 shrinks, about 5,700 ordinary requests).
+
+| Symbol | What it is | Measured |
+|---|---|---|
+| F | Context size on the first request after a shrink (median) | 39.5k |
+| g | How much the context grows per turn (mean) | 1.8k |
+| E | Extra cache writing after a shrink. The six requests after a shrink write 38.3k into the cache, against 6 × 1.77k for six ordinary requests. | 27.7k |
+| R | Extra re-reading after a shrink: files opened again and `recall` answers, compared with random points in a session | 0.7k |
+| w | Price of writing a token to the cache (1-hour cache: 2× input) relative to reading one (0.1× input) | 20 |
+
+The one-off cost of a shrink, counted in cache reads, is
+
+$$C = w\,(E + R) = 20 \times (27.7\text{k} + 0.7\text{k}) \approx 568\text{k}$$
+
+So one shrink costs about as much as re-reading 568k cached tokens, which is six or seven turns at a 90k context.
+The Haiku call that writes the handoff adds about 1% of that, so it is left out.
+
+### The cost per turn
+
+Between two shrinks the context climbs from F to the threshold T, by g per turn. Then it drops back to F.
+
+<p align="center"><picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/economics-cycle-dark.svg">
+  <img src="assets/economics-cycle-light.svg" alt="Context size over turns: a sawtooth rising from F to T, then dropping back to F at each shrink" width="100%">
+</picture></p>
+
+One cycle lasts (T − F) / g turns. During a cycle the average context is (F + T) / 2, and the cycle pays for one
+shrink. Spread over the cycle, the cost per turn is
+
+$$c(T) = \underbrace{\frac{F + T}{2}}_{\text{reading the context}} + \underbrace{\frac{C\,g}{T - F}}_{\text{shrinks}}$$
+
+The new tokens each turn adds are written to the cache whatever T is, so they do not affect the choice and are
+left out. The first term grows with T, because a higher threshold means a larger context on every turn. The
+second term shrinks with T, because a higher threshold means fewer shrinks.
+
+### Finding the minimum
+
+The total is lowest where its slope is zero:
+
+$$\frac{dc}{dT} = \frac{1}{2} - \frac{C\,g}{(T - F)^2} = 0 \quad\Longrightarrow\quad T^{*} = F + \sqrt{2\,g\,C}$$
+
+With the measured inputs:
+
+$$T^{*} = 39.5\text{k} + \sqrt{2 \times 1.8\text{k} \times 568\text{k}} = 39.5\text{k} + 45.2\text{k} \approx 85\text{k}$$
+
+<p align="center"><picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/economics-cost-dark.svg">
+  <img src="assets/economics-cost-light.svg" alt="Cost per turn against the threshold: the reading cost rises in a straight line, the shrink cost falls, and their sum is lowest at 85k" width="100%">
+</picture></p>
+
+The bottom of the curve is flat. Below the minimum the shrink cost takes over: as T gets close to F, there is almost no room to grow between
+shrinks, and the cost per turn shoots up. Above the minimum the cost climbs slowly, in a near-straight line.
+Compared with the cheapest point:
+
+| Threshold | Turns between shrinks | Cost per turn |
+|---|---|---|
+| 50k | 6 | +68% |
+| 70k | 17 | +4% |
+| **85k** | **25** | **lowest** |
+| **100k** | **34** | **+2%** |
+| 117k | 43 | +8% |
+| 167k (what a `200000` window gives) | 71 | +31% |
+| 250k | 117 | +77% |
+| 300k | 145 | +105% |
+
+### The recommendation
+
+Set `autoCompactWindow` to `133000`. Claude Code keeps a reserve of about 33k, so a shrink starts at 100k.
+
+100k rather than 85k, because the formula prices only tokens. Each shrink also loses some working detail that
+`recall` then has to fetch. 100k shrinks about a quarter less often than 85k and costs about 2% more per turn.
+The choice also holds up if your inputs differ. T* moves with the square root of g × C, so doubling the shrink
+cost only moves the optimum to about 104k, and halving it moves it to about 72k. Both stay close to 100k on a
+flat curve.
+
+To fit the value to your own work, measure F and g from your sessions and put them into T* = F + √(2gC). Then set
+`autoCompactWindow` to about T* + 33000, but not below `100000`. Run `python3 assets/economics.py` to redraw
+the diagrams. The inputs are at the top of the file.
 
 ## Files it writes
 
